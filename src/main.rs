@@ -124,7 +124,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     if let Some(ref model) = config.completion_model {
         tracing::info!("Completion Model Override: {}", model);
     }
-    if config.api_key.is_some() {
+    if config.passthrough_api_key {
+        tracing::info!("API Key: passthrough mode (extracted from x-api-key header)");
+    } else if config.api_key.is_some() {
         tracing::info!("API Key: configured");
     } else {
         tracing::info!("API Key: not set (using unauthenticated endpoint)");

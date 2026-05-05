@@ -7,6 +7,7 @@ pub struct Config {
     pub port: u16,
     pub upstream_urls: Vec<String>,
     pub api_key: Option<String>,
+    pub passthrough_api_key: bool,
     pub model_map: BTreeMap<String, String>,
     pub system_prompt_ignore_terms: Vec<String>,
     pub reasoning_model: Option<String>,
@@ -21,6 +22,7 @@ impl Default for Config {
             port: 3000,
             upstream_urls: vec!["http://localhost:11434".to_string()],
             api_key: None,
+            passthrough_api_key: false,
             model_map: BTreeMap::new(),
             system_prompt_ignore_terms: Vec::new(),
             reasoning_model: None,
@@ -122,10 +124,24 @@ impl Config {
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
 
+        let passthrough_api_key = env::var("UPSTREAM_API_KEY_PASSTHROUGH")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        // Validate: UPSTREAM_API_KEY_PASSTHROUGH requires UPSTREAM_API_KEY to be unset
+        if passthrough_api_key && api_key.is_some() {
+            bail!(
+                "UPSTREAM_API_KEY_PASSTHROUGH=true cannot be used together with UPSTREAM_API_KEY.\n\
+                 When passthrough is enabled, the API key is extracted from each incoming request's x-api-key header.\n\
+                 Unset UPSTREAM_API_KEY or set UPSTREAM_API_KEY_PASSTHROUGH=false."
+            );
+        }
+
         Ok(Config {
             port,
             upstream_urls,
             api_key,
+            passthrough_api_key,
             model_map,
             system_prompt_ignore_terms,
             reasoning_model,
@@ -548,5 +564,33 @@ mod tests {
         assert_eq!(urls.len(), 2);
         assert_eq!(urls[0], "https://openrouter.ai/api/v1/chat/completions");
         assert_eq!(urls[1], "https://api.openai.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn passthrough_api_key_defaults_to_false() {
+        let config = Config::default();
+        assert!(!config.passthrough_api_key);
+    }
+
+    #[test]
+    fn passthrough_disabled_with_static_key_works() {
+        let config = Config {
+            api_key: Some("sk-test".to_string()),
+            passthrough_api_key: false,
+            ..Default::default()
+        };
+        assert!(!config.passthrough_api_key);
+        assert_eq!(config.api_key, Some("sk-test".to_string()));
+    }
+
+    #[test]
+    fn passthrough_enabled_with_no_static_key() {
+        let config = Config {
+            api_key: None,
+            passthrough_api_key: true,
+            ..Default::default()
+        };
+        assert!(config.passthrough_api_key);
+        assert!(config.api_key.is_none());
     }
 }

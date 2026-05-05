@@ -85,6 +85,7 @@ Configuration can be set via environment variables or `.env` file:
 |----------|----------|---------|-------------|
 | `UPSTREAM_BASE_URL` | **Yes** | - | OpenAI-compatible endpoint URL |
 | `UPSTREAM_API_KEY` | No* | - | API key for upstream service |
+| `UPSTREAM_API_KEY_PASSTHROUGH` | No | `false` | Extract API key from incoming `x-api-key` header per request (`true`/`false`) |
 | `PORT` | No | `3000` | Server port |
 | `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS` | No | - | System prompt terms to remove before forwarding upstream (`;` or newline separated) |
 | `ANTHROPIC_PROXY_MODEL_MAP` | No | - | Exact model remapping before the upstream call (`source=target;other=target`) |
@@ -120,6 +121,24 @@ The proxy searches for `.env` files in the following order:
 4. System-wide config (`/etc/anthropic-proxy/.env`)
 
 If no `.env` file is found, the proxy uses environment variables from your shell.
+
+### API Key Passthrough
+
+When `UPSTREAM_API_KEY_PASSTHROUGH=true` is set, the proxy extracts the API key from each incoming request's `x-api-key` header (the standard header used by Anthropic SDKs and clients) and forwards it as `Authorization: Bearer {key}` to the upstream OpenAI-compatible endpoint.
+
+This is useful when you want each client to authenticate with its own key to the upstream service, rather than using a single static key configured in `UPSTREAM_API_KEY`.
+
+```bash
+# Enable passthrough mode (UPSTREAM_API_KEY must NOT be set)
+UPSTREAM_API_KEY_PASSTHROUGH=true \
+UPSTREAM_BASE_URL=https://openrouter.ai/api \
+anthropic-proxy
+```
+
+**Important constraints:**
+- `UPSTREAM_API_KEY_PASSTHROUGH=true` **cannot** be combined with `UPSTREAM_API_KEY`. If both are set, the proxy will refuse to start.
+- If passthrough is enabled but the incoming request has no `x-api-key` header (or an empty one), no `Authorization` header is sent upstream — the upstream endpoint decides whether to accept unauthenticated requests.
+- Passthrough applies to both `/v1/messages` and `/v1/models` endpoints, as both receive the `x-api-key` header from Anthropic clients.
 
 ## Usage Examples
 

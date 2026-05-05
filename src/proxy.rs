@@ -18,10 +18,13 @@ use std::time::{Duration, Instant};
 pub async fn proxy_handler(
     Extension(config): Extension<Arc<Config>>,
     Extension(client): Extension<Client>,
+    headers: HeaderMap,
     Json(req): Json<anthropic::AnthropicRequest>,
 ) -> ProxyResult<Response> {
     let is_streaming = req.stream.unwrap_or(false);
     let start = Instant::now();
+
+    let api_key = resolve_api_key(&config, &headers);
 
     tracing::debug!("Received request for model: {}", req.model);
     tracing::debug!("Streaming: {}", is_streaming);
@@ -45,9 +48,9 @@ pub async fn proxy_handler(
     }
 
     let result = if is_streaming {
-        handle_streaming(config, client, openai_req).await
+        handle_streaming(config, client, openai_req, api_key).await
     } else {
-        handle_non_streaming(config, client, openai_req).await
+        handle_non_streaming(config, client, openai_req, api_key).await
     };
 
     let status = match &result {
@@ -62,7 +65,9 @@ pub async fn proxy_handler(
 pub async fn list_models_handler(
     Extension(config): Extension<Arc<Config>>,
     Extension(client): Extension<Client>,
+    headers: HeaderMap,
 ) -> ProxyResult<Response> {
+    let api_key = resolve_api_key(&config, &headers);
     let urls = config.models_urls();
     let mut last_err = None;
 
@@ -70,8 +75,8 @@ pub async fn list_models_handler(
         tracing::debug!("Fetching models from {}", url);
 
         let mut req_builder = client.get(url).timeout(Duration::from_secs(60));
-        if let Some(api_key) = &config.api_key {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+        if let Some(ref key) = api_key {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
         }
 
         match req_builder.send().await {
@@ -109,6 +114,18 @@ pub async fn list_models_handler(
     ))
 }
 
+fn resolve_api_key(config: &Config, headers: &HeaderMap) -> Option<String> {
+    if config.passthrough_api_key {
+        headers
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+    } else {
+        config.api_key.clone()
+    }
+}
+
 fn translation_policy(config: &Config) -> pipeline::TranslationPolicy {
     pipeline::TranslationPolicy {
         reasoning_model: config.reasoning_model.clone(),
@@ -126,6 +143,7 @@ async fn handle_non_streaming(
     config: Arc<Config>,
     client: Client,
     openai_req: openai::OpenAIRequest,
+    api_key: Option<String>,
 ) -> ProxyResult<Response> {
     let urls = config.chat_completions_urls();
     let mut last_err = None;
@@ -142,8 +160,8 @@ async fn handle_non_streaming(
             .json(&openai_req)
             .timeout(Duration::from_secs(300));
 
-        if let Some(api_key) = &config.api_key {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+        if let Some(ref key) = api_key {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
         }
 
         let upstream_start = Instant::now();
@@ -219,6 +237,7 @@ async fn handle_streaming(
     config: Arc<Config>,
     client: Client,
     openai_req: openai::OpenAIRequest,
+    api_key: Option<String>,
 ) -> ProxyResult<Response> {
     let urls = config.chat_completions_urls();
     let mut last_err = None;
@@ -235,8 +254,8 @@ async fn handle_streaming(
             .json(&openai_req)
             .timeout(Duration::from_secs(300));
 
-        if let Some(api_key) = &config.api_key {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+        if let Some(ref key) = api_key {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
         }
 
         let upstream_start = Instant::now();
@@ -472,6 +491,84 @@ mod tests {
         }
         events
     }
+
+use axum::http::HeaderMap;
+use crate::config::Config;
+
+fn make_x_api_key_header(value: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::HeaderName::from_static("x-api-key"),
+        axum::http::HeaderValue::from_str(value).unwrap(),
+    );
+    headers
+}
+
+#[tokio::test]
+async fn resolve_api_key_passthrough_extracts_x_api_key() {
+    let config = Config {
+        passthrough_api_key: true,
+        api_key: None,
+        ..Default::default()
+    };
+    let headers = make_x_api_key_header("sk-my-test-key");
+    let key = super::resolve_api_key(&config, &headers);
+    assert_eq!(key, Some("sk-my-test-key".to_string()));
+}
+
+#[tokio::test]
+async fn resolve_api_key_passthrough_ignores_empty_header() {
+    let config = Config {
+        passthrough_api_key: true,
+        api_key: None,
+        ..Default::default()
+    };
+    // Empty header value returns None
+    let key = super::resolve_api_key(&config, &HeaderMap::new());
+    assert_eq!(key, None);
+
+    // Explicitly empty value also returns None
+    let headers = make_x_api_key_header("");
+    let key = super::resolve_api_key(&config, &headers);
+    assert_eq!(key, None);
+}
+
+#[tokio::test]
+async fn resolve_api_key_passthrough_returns_none_when_missing() {
+    let config = Config {
+        passthrough_api_key: true,
+        api_key: None,
+        ..Default::default()
+    };
+    let headers = HeaderMap::new();
+    let key = super::resolve_api_key(&config, &headers);
+    assert_eq!(key, None);
+}
+
+#[tokio::test]
+async fn resolve_api_key_static_key_when_passthrough_disabled() {
+    let config = Config {
+        passthrough_api_key: false,
+        api_key: Some("sk-upstream".to_string()),
+        ..Default::default()
+    };
+    // Even if x-api-key is present, static key wins when passthrough is off
+    let headers = make_x_api_key_header("sk-ignored");
+    let key = super::resolve_api_key(&config, &headers);
+    assert_eq!(key, Some("sk-upstream".to_string()));
+}
+
+#[tokio::test]
+async fn resolve_api_key_both_missing_returns_none() {
+    let config = Config {
+        passthrough_api_key: false,
+        api_key: None,
+        ..Default::default()
+    };
+    let headers = HeaderMap::new();
+    let key = super::resolve_api_key(&config, &headers);
+    assert_eq!(key, None);
+}
 
     #[tokio::test]
     async fn text_stream_produces_message_start_content_block_and_stop() {
