@@ -492,83 +492,83 @@ mod tests {
         events
     }
 
-use axum::http::HeaderMap;
-use crate::config::Config;
+    use crate::config::Config;
+    use axum::http::HeaderMap;
 
-fn make_x_api_key_header(value: &str) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        axum::http::header::HeaderName::from_static("x-api-key"),
-        axum::http::HeaderValue::from_str(value).unwrap(),
-    );
-    headers
-}
+    fn make_x_api_key_header(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HeaderName::from_static("x-api-key"),
+            axum::http::HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
 
-#[tokio::test]
-async fn resolve_api_key_passthrough_extracts_x_api_key() {
-    let config = Config {
-        passthrough_api_key: true,
-        api_key: None,
-        ..Default::default()
-    };
-    let headers = make_x_api_key_header("sk-my-test-key");
-    let key = super::resolve_api_key(&config, &headers);
-    assert_eq!(key, Some("sk-my-test-key".to_string()));
-}
+    #[tokio::test]
+    async fn resolve_api_key_passthrough_extracts_x_api_key() {
+        let config = Config {
+            passthrough_api_key: true,
+            api_key: None,
+            ..Default::default()
+        };
+        let headers = make_x_api_key_header("sk-my-test-key");
+        let key = super::resolve_api_key(&config, &headers);
+        assert_eq!(key, Some("sk-my-test-key".to_string()));
+    }
 
-#[tokio::test]
-async fn resolve_api_key_passthrough_ignores_empty_header() {
-    let config = Config {
-        passthrough_api_key: true,
-        api_key: None,
-        ..Default::default()
-    };
-    // Empty header value returns None
-    let key = super::resolve_api_key(&config, &HeaderMap::new());
-    assert_eq!(key, None);
+    #[tokio::test]
+    async fn resolve_api_key_passthrough_ignores_empty_header() {
+        let config = Config {
+            passthrough_api_key: true,
+            api_key: None,
+            ..Default::default()
+        };
+        // Empty header value returns None
+        let key = super::resolve_api_key(&config, &HeaderMap::new());
+        assert_eq!(key, None);
 
-    // Explicitly empty value also returns None
-    let headers = make_x_api_key_header("");
-    let key = super::resolve_api_key(&config, &headers);
-    assert_eq!(key, None);
-}
+        // Explicitly empty value also returns None
+        let headers = make_x_api_key_header("");
+        let key = super::resolve_api_key(&config, &headers);
+        assert_eq!(key, None);
+    }
 
-#[tokio::test]
-async fn resolve_api_key_passthrough_returns_none_when_missing() {
-    let config = Config {
-        passthrough_api_key: true,
-        api_key: None,
-        ..Default::default()
-    };
-    let headers = HeaderMap::new();
-    let key = super::resolve_api_key(&config, &headers);
-    assert_eq!(key, None);
-}
+    #[tokio::test]
+    async fn resolve_api_key_passthrough_returns_none_when_missing() {
+        let config = Config {
+            passthrough_api_key: true,
+            api_key: None,
+            ..Default::default()
+        };
+        let headers = HeaderMap::new();
+        let key = super::resolve_api_key(&config, &headers);
+        assert_eq!(key, None);
+    }
 
-#[tokio::test]
-async fn resolve_api_key_static_key_when_passthrough_disabled() {
-    let config = Config {
-        passthrough_api_key: false,
-        api_key: Some("sk-upstream".to_string()),
-        ..Default::default()
-    };
-    // Even if x-api-key is present, static key wins when passthrough is off
-    let headers = make_x_api_key_header("sk-ignored");
-    let key = super::resolve_api_key(&config, &headers);
-    assert_eq!(key, Some("sk-upstream".to_string()));
-}
+    #[tokio::test]
+    async fn resolve_api_key_static_key_when_passthrough_disabled() {
+        let config = Config {
+            passthrough_api_key: false,
+            api_key: Some("sk-upstream".to_string()),
+            ..Default::default()
+        };
+        // Even if x-api-key is present, static key wins when passthrough is off
+        let headers = make_x_api_key_header("sk-ignored");
+        let key = super::resolve_api_key(&config, &headers);
+        assert_eq!(key, Some("sk-upstream".to_string()));
+    }
 
-#[tokio::test]
-async fn resolve_api_key_both_missing_returns_none() {
-    let config = Config {
-        passthrough_api_key: false,
-        api_key: None,
-        ..Default::default()
-    };
-    let headers = HeaderMap::new();
-    let key = super::resolve_api_key(&config, &headers);
-    assert_eq!(key, None);
-}
+    #[tokio::test]
+    async fn resolve_api_key_both_missing_returns_none() {
+        let config = Config {
+            passthrough_api_key: false,
+            api_key: None,
+            ..Default::default()
+        };
+        let headers = HeaderMap::new();
+        let key = super::resolve_api_key(&config, &headers);
+        assert_eq!(key, None);
+    }
 
     #[tokio::test]
     async fn text_stream_produces_message_start_content_block_and_stop() {
