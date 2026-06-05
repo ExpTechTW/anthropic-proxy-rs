@@ -80,9 +80,24 @@ pub async fn proxy_handler(
 /// `POST /v1/messages/count_tokens` — Claude Code calls this for context budgeting.
 /// The upstream exposes no count endpoint, so we return a local heuristic estimate.
 pub async fn count_tokens_handler(
+    Extension(config): Extension<Arc<Config>>,
     Json(req): Json<anthropic::CountTokensRequest>,
 ) -> ProxyResult<Response> {
+    if config.verbose {
+        tracing::trace!(
+            "count_tokens request: {}",
+            serde_json::to_string_pretty(&req).unwrap_or_default()
+        );
+    }
+
     let input_tokens = pipeline::estimate_input_tokens(&req);
+    tracing::debug!(
+        messages = req.messages.len(),
+        tools = req.tools.as_ref().map_or(0, Vec::len),
+        input_tokens,
+        "count_tokens"
+    );
+
     Ok(Json(serde_json::json!({ "input_tokens": input_tokens })).into_response())
 }
 

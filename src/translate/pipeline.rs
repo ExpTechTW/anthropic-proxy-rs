@@ -156,63 +156,82 @@ pub fn translate_response(
     })
 }
 
+/// Per-message structural overhead (role markers, delimiters) in tokens.
+const PER_MESSAGE_OVERHEAD: usize = 4;
+
 /// Estimate the input token count for a count-tokens request.
 ///
-/// This is a heuristic (~4 UTF-8 bytes per token plus per-message overhead), not a
-/// real tokenizer — the OpenAI-compatible upstream exposes no count endpoint, so a
-/// stable ballpark is preferable to returning a 404 that breaks client context
-/// budgeting. Base64 image payloads are excluded so they don't inflate the count.
+/// Not a real tokenizer — the OpenAI-compatible upstream exposes no count endpoint,
+/// so we approximate. The estimate deliberately errs **high** (see [`estimate_text_tokens`])
+/// so Claude Code compacts a little early rather than under-counting and overflowing
+/// the context window. Base64 image payloads are excluded so they don't inflate it.
 pub fn estimate_input_tokens(req: &anthropic::CountTokensRequest) -> u32 {
-    let mut chars = 0usize;
+    let mut tokens = 0usize;
 
     if let Some(system) = &req.system {
         match system {
-            anthropic::SystemPrompt::Single(text) => chars += text.len(),
+            anthropic::SystemPrompt::Single(text) => tokens += estimate_text_tokens(text),
             anthropic::SystemPrompt::Multiple(messages) => {
                 for msg in messages {
-                    chars += msg.text.len();
+                    tokens += estimate_text_tokens(&msg.text);
                 }
             }
         }
     }
 
     for msg in &req.messages {
-        chars += msg.role.len();
-        chars += estimate_content_chars(&msg.content);
+        tokens += estimate_text_tokens(&msg.role);
+        tokens += estimate_content_tokens(&msg.content);
+        tokens += PER_MESSAGE_OVERHEAD;
     }
 
     if let Some(tools) = &req.tools {
         for tool in tools {
-            chars += tool.name.len();
+            tokens += estimate_text_tokens(&tool.name);
             if let Some(description) = &tool.description {
-                chars += description.len();
+                tokens += estimate_text_tokens(description);
             }
-            chars += tool.input_schema.to_string().len();
+            tokens += estimate_text_tokens(&tool.input_schema.to_string());
         }
     }
 
-    let overhead = req.messages.len().saturating_mul(4);
-    ((chars / 4) + overhead).max(1) as u32
+    tokens.max(1) as u32
 }
 
-fn estimate_content_chars(content: &anthropic::MessageContent) -> usize {
+/// Conservative per-text token estimate. ASCII counts at ~3.5 chars/token (code and
+/// markup tokenize denser than the usual ~4 chars/token English rule of thumb), and
+/// every non-ASCII char (CJK, etc.) as ~1 token. Both bias the count upward on purpose.
+fn estimate_text_tokens(text: &str) -> usize {
+    let mut ascii = 0usize;
+    let mut wide = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            ascii += 1;
+        } else {
+            wide += 1;
+        }
+    }
+    ascii * 2 / 7 + wide // ascii / 3.5 + one token per wide char
+}
+
+fn estimate_content_tokens(content: &anthropic::MessageContent) -> usize {
     match content {
-        anthropic::MessageContent::Text(text) => text.len(),
-        anthropic::MessageContent::Blocks(blocks) => blocks.iter().map(estimate_block_chars).sum(),
+        anthropic::MessageContent::Text(text) => estimate_text_tokens(text),
+        anthropic::MessageContent::Blocks(blocks) => blocks.iter().map(estimate_block_tokens).sum(),
     }
 }
 
-fn estimate_block_chars(block: &anthropic::ContentBlock) -> usize {
+fn estimate_block_tokens(block: &anthropic::ContentBlock) -> usize {
     match block {
-        anthropic::ContentBlock::Text { text, .. } => text.len(),
-        anthropic::ContentBlock::Thinking { thinking } => thinking.len(),
+        anthropic::ContentBlock::Text { text, .. } => estimate_text_tokens(text),
+        anthropic::ContentBlock::Thinking { thinking } => estimate_text_tokens(thinking),
         anthropic::ContentBlock::ToolUse { name, input, .. } => {
-            name.len() + input.to_string().len()
+            estimate_text_tokens(name) + estimate_text_tokens(&input.to_string())
         }
         anthropic::ContentBlock::ToolResult { content, .. } => match content {
-            anthropic::ToolResultContent::Text(text) => text.len(),
+            anthropic::ToolResultContent::Text(text) => estimate_text_tokens(text),
             anthropic::ToolResultContent::Blocks(blocks) => {
-                blocks.iter().map(estimate_block_chars).sum()
+                blocks.iter().map(estimate_block_tokens).sum()
             }
         },
         // Image payloads (base64) are intentionally not counted — they would
@@ -1119,6 +1138,17 @@ mod tests {
         assert!(estimate_input_tokens(&small) >= 1);
         assert!(estimate_input_tokens(&large) > estimate_input_tokens(&small));
         assert!(estimate_input_tokens(&large) >= 1000); // ~4000 chars / 4
+    }
+
+    #[test]
+    fn estimate_is_conservative_for_cjk() {
+        // CJK now counts ~1 token/char instead of the old bytes/4 (which under-counted).
+        let cjk: anthropic::CountTokensRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "你好世界你好世界你好世界"}]
+        }))
+        .unwrap();
+        // 12 CJK chars → ≥ 12 tokens (old bytes/4 would have been ~9).
+        assert!(estimate_input_tokens(&cjk) >= 12);
     }
 
     #[test]
