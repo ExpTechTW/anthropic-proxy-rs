@@ -240,13 +240,18 @@ async fn tokenize_prompt(
 
 /// Compute a `max_tokens` that actually fits the context window after an overflow 400.
 ///
-/// The upstream error reports input as "at least N", but that N is a *loose lower bound*
-/// equal to `context + 1 - max_tokens` — it rises as we shrink `max_tokens`, so the old
-/// "subtract a margin from the reported input" approach just crawls and never converges
-/// (observed: 88737 → 90840 → 92943 across retries while the real input was ~95k). Here we
-/// tokenize the *actual outgoing request* to get the true input size and clamp in one shot.
-/// Falls back to the error's lower bound only if tokenization is unavailable. Returns
-/// `None` when the prompt alone already fills the window (only compaction can fix that).
+/// We clamp against the *larger* of two input estimates:
+///   1. tokenizing the actual outgoing request (true size when the gateway can apply the
+///      model's chat template — includes tool-injection scaffolding), and
+///   2. the error's "at least N" figure, which equals `context + 1 - max_tokens` and is a
+///      *hard lower bound* that tightens toward the real input as `max_tokens` shrinks.
+///
+/// Taking the max matters: a prompt-only tokenizer (gateway without `messages` support)
+/// under-counts the tool template and would clamp *above* the real input, so the retry 400s
+/// again and the re-clamp computes the same value — it never converges (field: 32000 → 15746
+/// → fail, real input 89375 vs tokenized ~87272). The error's lower bound guarantees each
+/// retry moves down. Returns `None` when the prompt alone fills the window (only compaction
+/// can fix that).
 async fn clamp_for_overflow(
     client: &Client,
     config: &Config,
@@ -256,12 +261,11 @@ async fn clamp_for_overflow(
 ) -> Option<u32> {
     let (context, error_input) = core::parse_context_overflow(message)?;
 
-    let input = match config.tokenize_urls().into_iter().next() {
-        Some(url) => tokenize_openai_input(client, &url, openai, api_key)
-            .await
-            .unwrap_or(error_input),
-        None => error_input,
+    let tokenized = match config.tokenize_urls().into_iter().next() {
+        Some(url) => tokenize_openai_input(client, &url, openai, api_key).await,
+        None => None,
     };
+    let input = tokenized.unwrap_or(0).max(error_input);
 
     core::fit_output_to_window(context, input, openai.max_tokens)
 }
@@ -412,9 +416,9 @@ fn translation_policy(config: &Config) -> pipeline::TranslationPolicy {
 /// Max attempts per upstream URL (initial try + retries) for transient failures.
 const MAX_ATTEMPTS: usize = 3;
 
-/// Max context-overflow clamps per request. Each clamp uses the upstream's freshest
-/// (and usually more accurate) reported input count, so a couple of passes converge.
-const MAX_CLAMP_RETRIES: u32 = 2;
+/// Max context-overflow clamps per request. Each clamp tightens against the error's rising
+/// lower bound, so a few passes converge even when the local tokenizer under-counts.
+const MAX_CLAMP_RETRIES: u32 = 3;
 
 fn is_retriable_status(status: u16) -> bool {
     matches!(status, 429 | 500..=599)

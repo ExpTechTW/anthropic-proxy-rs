@@ -566,6 +566,27 @@ mod tests {
     }
 
     #[test]
+    fn clamp_converges_via_error_lower_bound() {
+        // Field regression: the tokenizer under-counted (87272) so clamping on it yields
+        // 15746, which does NOT fit the real 89375-token prompt. The caller instead clamps
+        // on max(tokenized, error_lower_bound) = 89375, which fits and is strictly smaller
+        // than the failed 15746 — so the retry makes progress instead of stalling.
+        let under_count = fit_output_to_window(105120, 87272, Some(32000)).unwrap();
+        assert_eq!(under_count, 15746);
+        assert!(
+            89375 + under_count > 105120,
+            "under-count clamp still overflows"
+        );
+
+        let on_lower_bound = fit_output_to_window(105120, 89375, Some(15746)).unwrap();
+        assert!(on_lower_bound < 15746, "retry must shrink max_tokens");
+        assert!(
+            89375 + on_lower_bound <= 105120,
+            "lower-bound clamp must fit"
+        );
+    }
+
+    #[test]
     fn clamp_none_for_unrelated_errors() {
         assert_eq!(parse_context_overflow("invalid api key"), None);
     }
