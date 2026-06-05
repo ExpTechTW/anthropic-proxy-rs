@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::error::{ProxyError, ProxyResult};
 use crate::metrics;
 use crate::models::{anthropic, openai};
-use crate::translate::{pipeline, stream};
+use crate::translate::{core, pipeline, stream};
 use axum::{
     body::Body,
     http::{HeaderMap, HeaderValue, StatusCode},
@@ -249,11 +249,12 @@ async fn send_request(
 async fn handle_non_streaming(
     config: Arc<Config>,
     client: Client,
-    openai_req: openai::OpenAIRequest,
+    mut openai_req: openai::OpenAIRequest,
     api_key: Option<String>,
 ) -> ProxyResult<Response> {
     let urls = config.chat_completions_urls();
     let mut last_err = None;
+    let mut clamped = false;
 
     for url in &urls {
         for attempt in 1..=MAX_ATTEMPTS {
@@ -292,6 +293,22 @@ async fn handle_non_streaming(
                     retriable,
                 } => {
                     metrics::upstream_error("chat_completions");
+                    // Self-heal a context-length overflow once: clamp max_tokens so
+                    // input + output fits the window, then retry. This unblocks the
+                    // deadlock where even /compact can't run because it requests output.
+                    if status.as_u16() == 400 && !clamped {
+                        if let Some(new_max) =
+                            core::clamp_max_tokens_for_overflow(openai_req.max_tokens, &message)
+                        {
+                            tracing::warn!(
+                                "upstream {url} context overflow; clamping max_tokens {:?} -> {new_max} and retrying",
+                                openai_req.max_tokens
+                            );
+                            openai_req.max_tokens = Some(new_max);
+                            clamped = true;
+                            continue;
+                        }
+                    }
                     if retriable {
                         tracing::warn!(
                             "upstream {url} attempt {attempt}/{MAX_ATTEMPTS} returned {status}: {message}"
@@ -377,11 +394,12 @@ async fn handle_non_streaming(
 async fn handle_streaming(
     config: Arc<Config>,
     client: Client,
-    openai_req: openai::OpenAIRequest,
+    mut openai_req: openai::OpenAIRequest,
     api_key: Option<String>,
 ) -> ProxyResult<Response> {
     let urls = config.chat_completions_urls();
     let mut last_err = None;
+    let mut clamped = false;
 
     // Only the connection handshake is retried; once bytes start streaming we are
     // committed (events may already have reached the client).
@@ -422,6 +440,22 @@ async fn handle_streaming(
                     retriable,
                 } => {
                     metrics::upstream_error("chat_completions");
+                    // Self-heal a context-length overflow once: clamp max_tokens so
+                    // input + output fits the window, then retry. This unblocks the
+                    // deadlock where even /compact can't run because it requests output.
+                    if status.as_u16() == 400 && !clamped {
+                        if let Some(new_max) =
+                            core::clamp_max_tokens_for_overflow(openai_req.max_tokens, &message)
+                        {
+                            tracing::warn!(
+                                "upstream {url} context overflow; clamping max_tokens {:?} -> {new_max} and retrying",
+                                openai_req.max_tokens
+                            );
+                            openai_req.max_tokens = Some(new_max);
+                            clamped = true;
+                            continue;
+                        }
+                    }
                     if retriable {
                         tracing::warn!(
                             "upstream {url} attempt {attempt}/{MAX_ATTEMPTS} returned {status}: {message}"

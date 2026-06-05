@@ -230,6 +230,49 @@ pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
     })
 }
 
+/// If `message` is an OpenAI-style "maximum context length" error and the prompt
+/// still leaves room for output, return a reduced `max_tokens` that fits the window.
+///
+/// This breaks the deadlock where a conversation is just over the limit: the upstream
+/// rejects `input + max_tokens > context`, but `input` alone still fits, so trimming
+/// the *output* budget lets the request through (including Claude Code's `/compact`,
+/// which otherwise can't run because it too requests output). Returns `None` when the
+/// error isn't a parseable context overflow or the prompt alone already fills the
+/// window (nothing an output clamp can fix).
+pub fn clamp_max_tokens_for_overflow(current_max: Option<u32>, message: &str) -> Option<u32> {
+    const MARGIN: u32 = 64; // headroom for the upstream's "at least" underestimates
+    const MIN_OUTPUT: u32 = 256;
+
+    let (context, input) = parse_context_overflow(message)?;
+    let available = context.checked_sub(input)?.checked_sub(MARGIN)?;
+    let current = current_max.unwrap_or(u32::MAX);
+
+    (available >= MIN_OUTPUT && available < current).then_some(available)
+}
+
+/// Parse `(max_context_tokens, input_tokens)` from an OpenAI-style overflow message.
+fn parse_context_overflow(message: &str) -> Option<(u32, u32)> {
+    let context = leading_number(message.split_once("context length is ")?.1)?;
+    let input = message
+        .split_once("contains at least ")
+        .and_then(|(_, rest)| leading_number(rest))
+        .or_else(|| trailing_number(message.split_once(" input tokens")?.0))?;
+    Some((context, input))
+}
+
+fn leading_number(s: &str) -> Option<u32> {
+    s.chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+fn trailing_number(s: &str) -> Option<u32> {
+    let reversed: String = s.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+    reversed.chars().rev().collect::<String>().parse().ok()
+}
+
 /// Split OpenAI prompt tokens into Anthropic `(input_tokens, cache_read_input_tokens)`.
 ///
 /// OpenAI's `prompt_tokens` is the *total* input including any cache hits, with the
@@ -495,6 +538,51 @@ mod tests {
             translate_tool_choice(&json!({"type": "tool"})),
             (None, None)
         );
+    }
+
+    #[test]
+    fn clamp_reduces_max_tokens_to_fit_context() {
+        // The real deadlock: 88737 input + 16384 output = 105121 > 105120.
+        let msg = "This model's maximum context length is 105120 tokens. However, you \
+                   requested 16384 output tokens and your prompt contains at least 88737 \
+                   input tokens, for a total of at least 105121 tokens.";
+        // context(105120) - input(88737) - margin(64) = 16319
+        assert_eq!(clamp_max_tokens_for_overflow(Some(16384), msg), Some(16319));
+    }
+
+    #[test]
+    fn clamp_none_when_prompt_alone_exceeds_window() {
+        let msg = "This model's maximum context length is 1000 tokens and your prompt \
+                   contains at least 1200 input tokens.";
+        assert_eq!(clamp_max_tokens_for_overflow(Some(500), msg), None);
+    }
+
+    #[test]
+    fn clamp_none_for_unrelated_errors() {
+        assert_eq!(
+            clamp_max_tokens_for_overflow(Some(16384), "invalid api key"),
+            None
+        );
+    }
+
+    #[test]
+    fn clamp_none_when_available_not_smaller_than_current() {
+        // Plenty of room — no need to clamp a small request.
+        let msg = "maximum context length is 105120 tokens; contains at least 1000 input tokens";
+        assert_eq!(clamp_max_tokens_for_overflow(Some(8000), msg), None);
+    }
+
+    #[test]
+    fn clamp_parses_input_via_trailing_fallback() {
+        // No "contains at least" phrasing — fall back to "<n> input tokens".
+        let msg = "maximum context length is 8192 tokens, but you have 8000 input tokens";
+        // 8192 - 8000 - 64 = 128 < MIN_OUTPUT(256) → None
+        assert_eq!(clamp_max_tokens_for_overflow(Some(4096), msg), None);
+        let msg2 = "maximum context length is 8192 tokens, but you have 4000 input tokens";
+        // 8192 - 4000 - 64 = 4128 ≥ 256 and < 4096? no, 4128 > 4096 → None
+        assert_eq!(clamp_max_tokens_for_overflow(Some(4096), msg2), None);
+        // request a larger output so the clamp engages
+        assert_eq!(clamp_max_tokens_for_overflow(Some(8000), msg2), Some(4128));
     }
 
     #[test]

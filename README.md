@@ -257,6 +257,7 @@ tail -f /tmp/anthropic-proxy.log    # logs
 
 - **Upstream status codes are preserved.** A client error (`400` invalid request, `401`/`403`/`404`, `413`, `429` rate limit) is surfaced with its original status and an Anthropic-shaped error body — `{"type":"error","error":{"type":...,"message":...}}` — instead of being masked as a generic `502`. Only genuine transport failures (no HTTP response) map to `502`.
 - **Transient failures are retried.** Connection / timeout / body-read errors and retriable statuses (`429`, `5xx`) are retried up to 3× per upstream URL with a fresh connection.
+- **Context-overflow auto-recovery.** If the upstream rejects a request because `input + max_tokens` exceeds the model's context window, the proxy clamps `max_tokens` to fit and retries once — so a conversation that's *just* over the limit (and even Claude Code's `/compact`, which otherwise dead-locks because it also requests output) can still complete instead of hard-failing on a `400`.
 - **Stale-connection hardening.** Pooled idle connections are kept short-lived with TCP keep-alive, eliminating the intermittent `502`s caused by reusing a socket the upstream silently closed.
 - **600 s request timeout**, matching a typical fronting nginx `proxy_read_timeout`, so long generations and streams are not cut short.
 
