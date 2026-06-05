@@ -112,9 +112,11 @@ pub async fn count_tokens_handler(
     Ok(Json(serde_json::json!({ "input_tokens": input_tokens })).into_response())
 }
 
-/// Get an exact token count from the upstream `/tokenize`: exact content tokens plus the
-/// per-message chat-template overhead. Returns `None` (→ local estimate) when disabled,
-/// the mapped model can't be tokenized (e.g. a routing alias like `auto`), or any step fails.
+/// Get an exact token count from the upstream `/tokenize`. Prefers the chat-aware form
+/// (the gateway applies the model's chat template, so `count` already includes per-message
+/// overhead — no estimate); falls back to plain-prompt tokenization plus our own overhead
+/// for gateways without `messages` support. Returns `None` (→ local estimate) when
+/// disabled, no model is given, or every attempt fails (failures are logged at WARN).
 async fn upstream_count_tokens(
     config: &Config,
     client: &Client,
@@ -125,29 +127,91 @@ async fn upstream_count_tokens(
         return None;
     }
 
-    // Map to the upstream model the same way a non-thinking request would.
-    let mut model = config
-        .completion_model
-        .clone()
-        .unwrap_or_else(|| req.model.clone());
-    model = config.model_map.get(&model).cloned().unwrap_or(model);
-    if model.is_empty() || model.eq_ignore_ascii_case("auto") {
-        return None; // /tokenize needs a concrete model
+    // Translate the count request exactly like a real chat request, so the tokenized
+    // messages match what the model is actually fed (system handling, tool_use/result,
+    // images, tool schemas). select_model maps "auto"/model_map the same way chat does.
+    let anth = anthropic::AnthropicRequest {
+        model: req.model.clone(),
+        messages: req.messages.clone(),
+        max_tokens: 1,
+        system: req.system.clone(),
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+        stream: None,
+        tools: req.tools.clone(),
+        metadata: None,
+        tool_choice: None,
+        extra: serde_json::Value::Null,
+    };
+    let openai = pipeline::translate_request(anth, &translation_policy(config)).ok()?;
+    if openai.model.is_empty() {
+        return None;
     }
 
     let url = config.tokenize_urls().into_iter().next()?;
+    let api_key = resolve_api_key(config, headers);
+
+    // 1. Chat-aware tokenize: exact, template-applied count with no overhead guess.
+    if let Some(count) = tokenize_chat(client, &url, &openai, api_key.as_deref()).await {
+        return Some(count);
+    }
+
+    // 2. Fallback (gateway without messages support): plain prompt + our per-message overhead.
+    tokenize_prompt(client, &url, &openai.model, req, api_key.as_deref()).await
+}
+
+/// Chat-aware `/tokenize`. Returns `None` so the caller falls back to the prompt form
+/// when the gateway rejects `messages` (older build) or the response is unusable. Stays
+/// quiet on failure — the prompt fallback logs if it fails too.
+async fn tokenize_chat(
+    client: &Client,
+    url: &str,
+    openai: &openai::OpenAIRequest,
+    api_key: Option<&str>,
+) -> Option<u32> {
+    let mut req_builder = client
+        .post(url)
+        .json(&openai::TokenizeMessagesRequest {
+            model: openai.model.clone(),
+            messages: openai.messages.clone(),
+            tools: openai.tools.clone(),
+        })
+        .timeout(Duration::from_secs(30));
+    if let Some(key) = api_key {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+    }
+    let response = req_builder.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let tokenized: openai::TokenizeResponse = response.json().await.ok()?;
+    Some(tokenized.count)
+}
+
+/// Plain-prompt `/tokenize` plus our per-message chat-template overhead. A concrete model
+/// reached this point, so unexpected failures are logged at WARN before falling back.
+async fn tokenize_prompt(
+    client: &Client,
+    url: &str,
+    model: &str,
+    req: &anthropic::CountTokensRequest,
+    api_key: Option<&str>,
+) -> Option<u32> {
     let (prompt, message_count) = pipeline::collect_tokenize_text(req);
 
     let mut req_builder = client
-        .post(&url)
-        .json(&openai::TokenizeRequest { model, prompt })
+        .post(url)
+        .json(&openai::TokenizeRequest {
+            model: model.to_string(),
+            prompt,
+        })
         .timeout(Duration::from_secs(30));
-    if let Some(key) = resolve_api_key(config, headers) {
+    if let Some(key) = api_key {
         req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
     }
 
-    // A concrete model reached this point, so any failure here is unexpected (not the
-    // benign "auto" case) — log at WARN so a broken /tokenize doesn't silently degrade.
     let response = match req_builder.send().await {
         Ok(resp) => resp,
         Err(err) => {

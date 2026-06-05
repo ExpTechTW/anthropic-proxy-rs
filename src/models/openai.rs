@@ -44,11 +44,21 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
-/// Request to a vLLM-style `/tokenize` endpoint.
+/// Request to a vLLM-style `/tokenize` endpoint (plain text).
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenizeRequest {
     pub model: String,
     pub prompt: String,
+}
+
+/// Chat-aware `/tokenize` request: the gateway applies the model's chat template, so
+/// the returned `count` already includes per-message template overhead (no estimate).
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenizeMessagesRequest {
+    pub model: String,
+    pub messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
 }
 
 /// Response from `/tokenize` — `count` is the exact prompt token count (other fields
