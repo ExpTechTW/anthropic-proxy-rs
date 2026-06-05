@@ -84,19 +84,31 @@ anthropic-proxy
 
 ### Docker
 
-The repository's [`Dockerfile`](Dockerfile) **downloads the latest release binary** — no Rust toolchain, fast builds:
+The repository's [`Dockerfile`](Dockerfile) **downloads a prebuilt release binary** — no Rust toolchain, fast builds. Choose the channel with build args:
 
 ```bash
-# Build (latest full release; multi-arch with buildx)
+# Latest full release (default)
 docker build -t anthropic-proxy .
-# or pin a specific tag (incl. pre-releases):
+
+# Latest pre-release (main-branch builds)
+docker build -t anthropic-proxy --build-arg CHANNEL=prerelease .
+
+# Pin an exact tag (overrides CHANNEL; works for pre-releases too)
 docker build -t anthropic-proxy --build-arg VERSION=v2026.06.05+build.3 .
+
+# Multi-arch
+docker buildx build --platform linux/amd64,linux/arm64 -t anthropic-proxy .
 
 docker run -p 3000:3000 \
   -e UPSTREAM_BASE_URL=https://openrouter.ai/api \
   -e UPSTREAM_API_KEY=sk-or-... \
   anthropic-proxy
 ```
+
+| Build arg | Default | Meaning |
+|-----------|---------|---------|
+| `CHANNEL` | `release` | `release` = latest full release · `prerelease` = latest pre-release |
+| `VERSION` | (empty) | Pin an exact tag, e.g. `v2026.06.05+build.3` (overrides `CHANNEL`) |
 
 To compile from source instead, use [`Dockerfile.source`](Dockerfile.source):
 

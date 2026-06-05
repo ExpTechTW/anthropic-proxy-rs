@@ -84,19 +84,31 @@ anthropic-proxy
 
 ### Docker
 
-repo 的 [`Dockerfile`](Dockerfile) 會**直接下載最新 release 二進制** —— 不需 Rust 工具鏈,建置很快:
+repo 的 [`Dockerfile`](Dockerfile) 會**下載預編譯 release 二進制** —— 不需 Rust 工具鏈,建置很快。用 build args 選擇管道:
 
 ```bash
-# 建置(最新正式版;用 buildx 可多架構)
+# 最新正式版(預設)
 docker build -t anthropic-proxy .
-# 或釘特定 tag(含預發佈版):
+
+# 最新預發佈版(main 分支建置)
+docker build -t anthropic-proxy --build-arg CHANNEL=prerelease .
+
+# 釘特定 tag(覆寫 CHANNEL;預發佈版也適用)
 docker build -t anthropic-proxy --build-arg VERSION=v2026.06.05+build.3 .
+
+# 多架構
+docker buildx build --platform linux/amd64,linux/arm64 -t anthropic-proxy .
 
 docker run -p 3000:3000 \
   -e UPSTREAM_BASE_URL=https://openrouter.ai/api \
   -e UPSTREAM_API_KEY=sk-or-... \
   anthropic-proxy
 ```
+
+| Build arg | 預設 | 意義 |
+|-----------|------|------|
+| `CHANNEL` | `release` | `release` = 最新正式版 · `prerelease` = 最新預發佈版 |
+| `VERSION` | (空) | 釘特定 tag,例如 `v2026.06.05+build.3`(覆寫 `CHANNEL`) |
 
 若要改成從原始碼編譯,使用 [`Dockerfile.source`](Dockerfile.source):
 
