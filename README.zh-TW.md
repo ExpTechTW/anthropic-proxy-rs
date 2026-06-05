@@ -246,7 +246,8 @@ tail -f /tmp/anthropic-proxy.log    # 日誌
 ✅ `metadata.user_id`(轉成 OpenAI 的 `user`)
 ✅ `refusal` 停止原因(由上游 `content_filter` 對映)
 ✅ 停止序列、`max_tokens`、`temperature`、`top_p`
-✅ `POST /v1/messages/count_tokens`(本地啟發式估算)
+✅ `POST /v1/messages/count_tokens`(本地啟發式估算;也接受 `?beta=true`)
+✅ Prompt 快取 token 計量 —— 上游的 `prompt_tokens_details.cached_tokens` 會回報為 Anthropic 的 `cache_read_input_tokens`(並從 `input_tokens` 扣除),讓 Claude Code 的快取/成本統計正確
 
 > `top_k` 會被接受但不會轉發 —— Chat Completions 沒有對應參數。
 >

@@ -243,6 +243,23 @@ pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
     })
 }
 
+/// Split OpenAI prompt tokens into Anthropic `(input_tokens, cache_read_input_tokens)`.
+///
+/// OpenAI's `prompt_tokens` is the *total* input including any cache hits, with the
+/// cached subset reported under `prompt_tokens_details.cached_tokens`. Anthropic
+/// instead reports the non-cached input separately from `cache_read_input_tokens`,
+/// so we subtract to avoid double-counting cached tokens in client cost math. The
+/// cache figure is `None` when the upstream did not report cached tokens.
+pub fn split_prompt_tokens(usage: &openai::Usage) -> (u32, Option<u32>) {
+    match usage.prompt_tokens_details.as_ref() {
+        Some(details) => (
+            usage.prompt_tokens.saturating_sub(details.cached_tokens),
+            Some(details.cached_tokens),
+        ),
+        None => (usage.prompt_tokens, None),
+    }
+}
+
 /// Translate an Anthropic `tool_choice` into the OpenAI equivalent.
 ///
 /// Returns `(tool_choice, parallel_tool_calls)` where `parallel_tool_calls` carries

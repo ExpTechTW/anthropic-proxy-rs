@@ -151,6 +151,7 @@ pub fn translate_response(
     }
 
     let stop_reason = core::map_stop_reason(choice.finish_reason.as_deref());
+    let (input_tokens, cache_read_input_tokens) = core::split_prompt_tokens(&resp.usage);
 
     Ok(anthropic::AnthropicResponse {
         id: resp.id.unwrap_or_else(|| "msg_proxy".to_string()),
@@ -161,8 +162,10 @@ pub fn translate_response(
         stop_reason,
         stop_sequence: None,
         usage: anthropic::Usage {
-            input_tokens: resp.usage.prompt_tokens,
+            input_tokens,
             output_tokens: resp.usage.completion_tokens,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens,
         },
     })
 }
@@ -772,6 +775,7 @@ mod tests {
                 prompt_tokens: 5,
                 completion_tokens: 1,
                 total_tokens: 6,
+                ..Default::default()
             },
             system_fingerprint: None,
         };
@@ -802,6 +806,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 2,
                 total_tokens: 12,
+                ..Default::default()
             },
             system_fingerprint: None,
         };
@@ -839,6 +844,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                ..Default::default()
             },
             system_fingerprint: None,
         };
@@ -999,6 +1005,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                ..Default::default()
             },
             system_fingerprint: None,
         };
@@ -1068,12 +1075,27 @@ mod tests {
                 "logprobs": null,
                 "message": {"role": "assistant", "content": "hi", "annotations": []}
             }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3,
-                      "prompt_tokens_details": {"cached_tokens": 1}}
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+                      "prompt_tokens_details": {"cached_tokens": 4}}
         }));
         let anthropic = translate_response(resp, "fallback").unwrap();
-        assert_eq!(anthropic.usage.input_tokens, 1);
+        // Cached tokens are split out: input = prompt(10) - cached(4), cache_read = 4.
+        assert_eq!(anthropic.usage.input_tokens, 6);
         assert_eq!(anthropic.usage.output_tokens, 2);
+        assert_eq!(anthropic.usage.cache_read_input_tokens, Some(4));
+    }
+
+    #[test]
+    fn response_without_cache_details_omits_cache_fields() {
+        let resp = parse_response(json!({
+            "id": "chatcmpl-1",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}
+        }));
+        let anthropic = translate_response(resp, "fallback").unwrap();
+        assert_eq!(anthropic.usage.input_tokens, 7);
+        assert_eq!(anthropic.usage.cache_read_input_tokens, None);
+        assert_eq!(anthropic.usage.cache_creation_input_tokens, None);
     }
 
     #[test]

@@ -246,7 +246,8 @@ tail -f /tmp/anthropic-proxy.log    # logs
 ✅ `metadata.user_id` (forwarded as OpenAI `user`)
 ✅ `refusal` stop reason (mapped from upstream `content_filter`)
 ✅ Stop sequences, `max_tokens`, `temperature`, `top_p`
-✅ `POST /v1/messages/count_tokens` (local heuristic estimate)
+✅ `POST /v1/messages/count_tokens` (local heuristic estimate; also accepts `?beta=true`)
+✅ Prompt-cache token accounting — upstream `prompt_tokens_details.cached_tokens` is reported as Anthropic `cache_read_input_tokens` (and excluded from `input_tokens`), so Claude Code's cache/cost stats are accurate
 
 > `top_k` is accepted but not forwarded — Chat Completions has no equivalent.
 >

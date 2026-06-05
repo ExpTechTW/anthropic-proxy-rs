@@ -159,6 +159,16 @@ pub struct Usage {
     pub completion_tokens: u32,
     #[serde(default)]
     pub total_tokens: u32,
+    // OpenAI reports cached (prompt-cache) tokens here; surfaced to clients as
+    // Anthropic `cache_read_input_tokens` so cost/cache stats stay accurate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

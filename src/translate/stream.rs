@@ -79,6 +79,7 @@ pub fn translate_chunk(state: &mut StreamState, chunk: &openai::StreamChunk) -> 
                 usage: Usage {
                     input_tokens: 0,
                     output_tokens: 0,
+                    ..Default::default()
                 },
             },
         });
@@ -224,14 +225,23 @@ fn emit_finish(
 
     let stop_reason = core::map_stop_reason(Some(finish_reason));
 
+    let (input_tokens, cache_read_input_tokens) = match usage {
+        Some(u) => {
+            let (input, cache_read) = core::split_prompt_tokens(u);
+            (Some(input), cache_read)
+        }
+        None => (None, None),
+    };
+
     events.push(StreamEvent::MessageDelta {
         delta: MessageDeltaData {
             stop_reason,
             stop_sequence: None,
         },
         usage: DeltaUsage {
-            input_tokens: usage.map(|u| u.prompt_tokens),
+            input_tokens,
             output_tokens: usage.map(|u| u.completion_tokens).unwrap_or(0),
+            cache_read_input_tokens,
         },
     });
 }
@@ -421,6 +431,32 @@ mod tests {
 
         if let StreamEvent::MessageDelta { delta, .. } = &e3[1] {
             assert_eq!(delta.stop_reason.as_deref(), Some("tool_use"));
+        }
+    }
+
+    #[test]
+    fn finish_chunk_maps_cached_tokens_to_cache_read() {
+        let mut state = initial_state("fallback".into());
+        translate_chunk(&mut state, &text_chunk("1", "gpt-4o", "hi"));
+
+        let chunk: openai::StreamChunk = serde_json::from_value(json!({
+            "id": "1", "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            "usage": {
+                "prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105,
+                "prompt_tokens_details": { "cached_tokens": 80 }
+            }
+        }))
+        .unwrap();
+        let events = translate_chunk(&mut state, &chunk);
+
+        if let StreamEvent::MessageDelta { usage, .. } = &events[1] {
+            // input = prompt(100) - cached(80); cache_read = 80
+            assert_eq!(usage.input_tokens, Some(20));
+            assert_eq!(usage.cache_read_input_tokens, Some(80));
+            assert_eq!(usage.output_tokens, 5);
+        } else {
+            panic!("expected message_delta");
         }
     }
 
