@@ -94,6 +94,9 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+          cache-on-failure: true
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -127,7 +130,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          # Per-target cache (artifacts differ by target); persist even on failure.
+          shared-key: build-${{ matrix.target }}
+          cache-on-failure: true
 
       - name: Install musl tools
         if: endsWith(matrix.target, 'linux-musl')
