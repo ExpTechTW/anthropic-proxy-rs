@@ -9,6 +9,8 @@ pub struct Config {
     pub upstream_urls: Vec<String>,
     pub api_key: Option<String>,
     pub passthrough_api_key: bool,
+    /// Forward count_tokens to the upstream `/tokenize` for exact counts (opt-in).
+    pub upstream_tokenize: bool,
     pub model_map: BTreeMap<String, String>,
     pub system_prompt_ignore_terms: Vec<String>,
     pub reasoning_model: Option<String>,
@@ -25,6 +27,7 @@ impl Default for Config {
             upstream_urls: vec!["http://localhost:11434".to_string()],
             api_key: None,
             passthrough_api_key: false,
+            upstream_tokenize: false,
             model_map: BTreeMap::new(),
             system_prompt_ignore_terms: Vec::new(),
             reasoning_model: None,
@@ -131,6 +134,10 @@ impl Config {
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
 
+        let upstream_tokenize = env::var("ANTHROPIC_PROXY_UPSTREAM_TOKENIZE")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         // Validate: UPSTREAM_API_KEY_PASSTHROUGH requires UPSTREAM_API_KEY to be unset
         if passthrough_api_key && api_key.is_some() {
             bail!(
@@ -146,6 +153,7 @@ impl Config {
             upstream_urls,
             api_key,
             passthrough_api_key,
+            upstream_tokenize,
             model_map,
             system_prompt_ignore_terms,
             reasoning_model,
@@ -153,6 +161,14 @@ impl Config {
             debug,
             verbose,
         })
+    }
+
+    /// Upstream `/tokenize` URLs (siblings of the chat-completions endpoints).
+    pub fn tokenize_urls(&self) -> Vec<String> {
+        self.chat_completions_urls()
+            .into_iter()
+            .map(|url| url.replace("/chat/completions", "/tokenize"))
+            .collect()
     }
 
     pub fn chat_completions_urls(&self) -> Vec<String> {

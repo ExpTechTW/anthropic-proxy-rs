@@ -33,6 +33,8 @@ pub struct AnthropicRequest {
 /// but without `max_tokens` (which the count-tokens endpoint does not require).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CountTokensRequest {
+    #[serde(default)]
+    pub model: String,
     pub messages: Vec<Message>,
     #[serde(default)]
     pub system: Option<SystemPrompt>,

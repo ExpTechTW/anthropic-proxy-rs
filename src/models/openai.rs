@@ -44,6 +44,20 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
+/// Request to a vLLM-style `/tokenize` endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenizeRequest {
+    pub model: String,
+    pub prompt: String,
+}
+
+/// Response from `/tokenize` — `count` is the exact prompt token count (other fields
+/// such as `max_model_len`/`tokens` are ignored).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenizeResponse {
+    pub count: u32,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,

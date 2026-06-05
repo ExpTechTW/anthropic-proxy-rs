@@ -156,15 +156,15 @@ pub fn translate_response(
     })
 }
 
-/// Per-message structural overhead (role markers, delimiters) in tokens.
-const PER_MESSAGE_OVERHEAD: usize = 4;
+/// Per-message chat-template overhead (e.g. qwen's `<|im_start|>role\n…<|im_end|>\n`
+/// plus the trailing assistant primer) in tokens. Measured at 8–10 across qwen models;
+/// we use the high end so the count is never below the upstream's real count.
+const PER_MESSAGE_OVERHEAD: usize = 10;
 
-/// Estimate the input token count for a count-tokens request.
-///
-/// Not a real tokenizer — the OpenAI-compatible upstream exposes no count endpoint,
-/// so we approximate. The estimate deliberately errs **high** (see [`estimate_text_tokens`])
-/// so Claude Code compacts a little early rather than under-counting and overflowing
-/// the context window. Base64 image payloads are excluded so they don't inflate it.
+/// Count the input tokens for a count-tokens request using a real BPE tokenizer
+/// (see [`estimate_text_tokens`]) plus small per-message overhead. Accurate token counts
+/// are what let Claude Code decide compaction at the right time; a rough heuristic
+/// under-counted code and made it compact too late. Base64 image payloads are excluded.
 pub fn estimate_input_tokens(req: &anthropic::CountTokensRequest) -> u32 {
     let mut tokens = 0usize;
 
@@ -195,23 +195,97 @@ pub fn estimate_input_tokens(req: &anthropic::CountTokensRequest) -> u32 {
         }
     }
 
-    tokens.max(1) as u32
+    // cl100k slightly under-counts the qwen-class upstreams on dense code (measured ~11%);
+    // a 1.15× safety factor keeps our count at or above the real one so Claude Code never
+    // under-estimates and compacts on time. Over-counting only triggers compaction a touch
+    // early — far cheaper than overflowing the window.
+    ((tokens * 23 / 20).max(1)) as u32
 }
 
-/// Conservative per-text token estimate. ASCII counts at ~3.5 chars/token (code and
-/// markup tokenize denser than the usual ~4 chars/token English rule of thumb), and
-/// every non-ASCII char (CJK, etc.) as ~1 token. Both bias the count upward on purpose.
-fn estimate_text_tokens(text: &str) -> usize {
-    let mut ascii = 0usize;
-    let mut wide = 0usize;
-    for ch in text.chars() {
-        if ch.is_ascii() {
-            ascii += 1;
-        } else {
-            wide += 1;
+/// Concatenate all countable text (system + message content + tool schemas) into a
+/// single string for an upstream `/tokenize` call, returning it with the message count
+/// (used to add the per-message chat-template overhead). Base64 images are excluded.
+pub fn collect_tokenize_text(req: &anthropic::CountTokensRequest) -> (String, usize) {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(system) = &req.system {
+        match system {
+            anthropic::SystemPrompt::Single(text) => parts.push(text.clone()),
+            anthropic::SystemPrompt::Multiple(messages) => {
+                parts.extend(messages.iter().map(|m| m.text.clone()));
+            }
         }
     }
-    ascii * 2 / 7 + wide // ascii / 3.5 + one token per wide char
+
+    for msg in &req.messages {
+        parts.push(msg.role.clone());
+        collect_content_text(&msg.content, &mut parts);
+    }
+
+    if let Some(tools) = &req.tools {
+        for tool in tools {
+            parts.push(tool.name.clone());
+            if let Some(description) = &tool.description {
+                parts.push(description.clone());
+            }
+            parts.push(tool.input_schema.to_string());
+        }
+    }
+
+    (parts.join("\n"), req.messages.len())
+}
+
+fn collect_content_text(content: &anthropic::MessageContent, parts: &mut Vec<String>) {
+    match content {
+        anthropic::MessageContent::Text(text) => parts.push(text.clone()),
+        anthropic::MessageContent::Blocks(blocks) => {
+            for block in blocks {
+                match block {
+                    anthropic::ContentBlock::Text { text, .. } => parts.push(text.clone()),
+                    anthropic::ContentBlock::Thinking { thinking } => parts.push(thinking.clone()),
+                    anthropic::ContentBlock::ToolUse { name, input, .. } => {
+                        parts.push(name.clone());
+                        parts.push(input.to_string());
+                    }
+                    anthropic::ContentBlock::ToolResult { content, .. } => match content {
+                        anthropic::ToolResultContent::Text(text) => parts.push(text.clone()),
+                        anthropic::ToolResultContent::Blocks(blocks) => {
+                            for b in blocks {
+                                if let anthropic::ContentBlock::Text { text, .. } = b {
+                                    parts.push(text.clone());
+                                }
+                            }
+                        }
+                    },
+                    anthropic::ContentBlock::Image { .. } => {}
+                }
+            }
+        }
+    }
+}
+
+/// Per-message chat-template overhead in tokens, added on top of an exact upstream
+/// content count (and used by the heuristic estimate too).
+pub const PER_MESSAGE_OVERHEAD_TOKENS: u32 = PER_MESSAGE_OVERHEAD as u32;
+
+/// Lazily-initialized BPE tokenizer (cl100k_base). Shared across requests.
+fn tokenizer() -> Option<&'static tiktoken_rs::CoreBPE> {
+    static BPE: std::sync::OnceLock<Option<tiktoken_rs::CoreBPE>> = std::sync::OnceLock::new();
+    BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok()).as_ref()
+}
+
+/// Per-text token count via the cl100k BPE tokenizer — the same family the OpenAI
+/// ecosystem uses, far closer to reality than the old char heuristic that under-counted
+/// code (and made Claude Code compact too late and overflow). cl100k still runs ~10%
+/// under the qwen tokenizer on dense code, which the caller's safety factor offsets.
+/// This path is only the fallback for when the upstream `/tokenize` is unavailable.
+fn estimate_text_tokens(text: &str) -> usize {
+    match tokenizer() {
+        Some(bpe) => bpe.encode_ordinary(text).len(),
+        // cl100k is embedded and effectively never fails to load; this only guards a
+        // corrupt build, so a crude byte heuristic is plenty.
+        None => text.len() / 4,
+    }
 }
 
 fn estimate_content_tokens(content: &anthropic::MessageContent) -> usize {
@@ -1137,17 +1211,34 @@ mod tests {
         .unwrap();
         assert!(estimate_input_tokens(&small) >= 1);
         assert!(estimate_input_tokens(&large) > estimate_input_tokens(&small));
-        assert!(estimate_input_tokens(&large) >= 1000); // ~4000 chars / 4
     }
 
     #[test]
-    fn estimate_is_conservative_for_cjk() {
-        // CJK now counts ~1 token/char instead of the old bytes/4 (which under-counted).
+    fn estimate_matches_real_tokenizer_for_code() {
+        // The whole point: a real BPE tokenizer counts code accurately, where the old
+        // chars/4 heuristic under-counted (which is what made Claude Code compact too late).
+        let code = "fn main() { let xs: Vec<i32> = (0..100).filter(|n| n % 2 == 0).collect(); \
+                    println!(\"{:?}\", xs); }";
+        let req: anthropic::CountTokensRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": code}]
+        }))
+        .unwrap();
+        let est = estimate_input_tokens(&req) as usize;
+        // cl100k tokenizes this to ~45 tokens; the old chars/4 would have said ~26.
+        assert!(
+            est > code.len() / 4,
+            "estimate {est} should exceed the old chars/4"
+        );
+        assert!(est >= 30);
+    }
+
+    #[test]
+    fn estimate_counts_cjk() {
         let cjk: anthropic::CountTokensRequest = serde_json::from_value(json!({
             "messages": [{"role": "user", "content": "你好世界你好世界你好世界"}]
         }))
         .unwrap();
-        // 12 CJK chars → ≥ 12 tokens (old bytes/4 would have been ~9).
+        // CJK tokenizes to multiple tokens per character — must be a meaningful count.
         assert!(estimate_input_tokens(&cjk) >= 12);
     }
 

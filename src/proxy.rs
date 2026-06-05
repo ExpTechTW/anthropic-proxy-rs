@@ -78,9 +78,13 @@ pub async fn proxy_handler(
 }
 
 /// `POST /v1/messages/count_tokens` — Claude Code calls this for context budgeting.
-/// The upstream exposes no count endpoint, so we return a local heuristic estimate.
+/// Prefers the upstream `/tokenize` endpoint for an exact count (when enabled), and
+/// falls back to a local BPE estimate when it's disabled, the model can't be tokenized,
+/// or the upstream call fails.
 pub async fn count_tokens_handler(
     Extension(config): Extension<Arc<Config>>,
+    Extension(client): Extension<Client>,
+    headers: HeaderMap,
     Json(req): Json<anthropic::CountTokensRequest>,
 ) -> ProxyResult<Response> {
     if config.verbose {
@@ -90,15 +94,84 @@ pub async fn count_tokens_handler(
         );
     }
 
-    let input_tokens = pipeline::estimate_input_tokens(&req);
+    let (input_tokens, source) = match upstream_count_tokens(&config, &client, &headers, &req).await
+    {
+        Some(count) => (count, "upstream"),
+        None => (pipeline::estimate_input_tokens(&req), "estimate"),
+    };
+
     tracing::debug!(
+        model = %req.model,
         messages = req.messages.len(),
         tools = req.tools.as_ref().map_or(0, Vec::len),
         input_tokens,
+        source,
         "count_tokens"
     );
 
     Ok(Json(serde_json::json!({ "input_tokens": input_tokens })).into_response())
+}
+
+/// Get an exact token count from the upstream `/tokenize`: exact content tokens plus the
+/// per-message chat-template overhead. Returns `None` (→ local estimate) when disabled,
+/// the mapped model can't be tokenized (e.g. a routing alias like `auto`), or any step fails.
+async fn upstream_count_tokens(
+    config: &Config,
+    client: &Client,
+    headers: &HeaderMap,
+    req: &anthropic::CountTokensRequest,
+) -> Option<u32> {
+    if !config.upstream_tokenize {
+        return None;
+    }
+
+    // Map to the upstream model the same way a non-thinking request would.
+    let mut model = config
+        .completion_model
+        .clone()
+        .unwrap_or_else(|| req.model.clone());
+    model = config.model_map.get(&model).cloned().unwrap_or(model);
+    if model.is_empty() || model.eq_ignore_ascii_case("auto") {
+        return None; // /tokenize needs a concrete model
+    }
+
+    let url = config.tokenize_urls().into_iter().next()?;
+    let (prompt, message_count) = pipeline::collect_tokenize_text(req);
+
+    let mut req_builder = client
+        .post(&url)
+        .json(&openai::TokenizeRequest { model, prompt })
+        .timeout(Duration::from_secs(30));
+    if let Some(key) = resolve_api_key(config, headers) {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+    }
+
+    // A concrete model reached this point, so any failure here is unexpected (not the
+    // benign "auto" case) — log at WARN so a broken /tokenize doesn't silently degrade.
+    let response = match req_builder.send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::warn!("upstream /tokenize unreachable ({url}): {err}; using local estimate");
+            return None;
+        }
+    };
+    if !response.status().is_success() {
+        tracing::warn!(
+            "upstream /tokenize returned {}; using local estimate",
+            response.status()
+        );
+        return None;
+    }
+    let tokenized: openai::TokenizeResponse = match response.json().await {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!("upstream /tokenize body unparseable: {err}; using local estimate");
+            return None;
+        }
+    };
+
+    // Exact content tokens + the chat template's per-message overhead.
+    Some(tokenized.count + message_count as u32 * pipeline::PER_MESSAGE_OVERHEAD_TOKENS)
 }
 
 pub async fn list_models_handler(
