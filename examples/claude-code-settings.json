@@ -1,0 +1,9 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://your-proxy.example.com",
+    "ANTHROPIC_AUTH_TOKEN": "<your-upstream-api-key>",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "105120",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"
+  },
+  "model": "claude-sonnet-4-5"
+}

@@ -8,14 +8,11 @@ use thiserror::Error;
 
 /// Application-specific errors
 #[derive(Error, Debug)]
-#[allow(dead_code)]
 pub enum ProxyError {
-    #[error("Configuration error: {0}")]
-    Config(String),
-
     #[error("Request transformation error: {0}")]
     Transform(String),
 
+    /// A transport/connection failure with no usable HTTP status (mapped to 502).
     #[error("Upstream API error: {0}")]
     Upstream(String),
 
@@ -29,9 +26,6 @@ pub enum ProxyError {
 
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
-
-    #[error("Internal error: {0}")]
-    Internal(String),
 }
 
 /// Map an HTTP status to the matching Anthropic error `type` string so clients
@@ -53,7 +47,6 @@ impl ProxyError {
     /// The HTTP status this error maps to.
     pub fn status_code(&self) -> StatusCode {
         match self {
-            ProxyError::Config(_) | ProxyError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ProxyError::Transform(_) | ProxyError::Serialization(_) => StatusCode::BAD_REQUEST,
             ProxyError::Upstream(_) | ProxyError::Http(_) => StatusCode::BAD_GATEWAY,
             ProxyError::UpstreamStatus { status, .. } => *status,
@@ -62,10 +55,7 @@ impl ProxyError {
 
     fn message(self) -> String {
         match self {
-            ProxyError::Config(msg)
-            | ProxyError::Transform(msg)
-            | ProxyError::Upstream(msg)
-            | ProxyError::Internal(msg) => msg,
+            ProxyError::Transform(msg) | ProxyError::Upstream(msg) => msg,
             ProxyError::UpstreamStatus { message, .. } => message,
             ProxyError::Serialization(err) => format!("JSON error: {}", err),
             ProxyError::Http(err) => format!("HTTP error: {}", err),
@@ -103,14 +93,6 @@ mod tests {
     }
 
     #[test]
-    fn config_error_returns_500() {
-        assert_eq!(
-            status_of(ProxyError::Config("bad".into())),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-
-    #[test]
     fn transform_error_returns_400() {
         assert_eq!(
             status_of(ProxyError::Transform("bad".into())),
@@ -123,14 +105,6 @@ mod tests {
         assert_eq!(
             status_of(ProxyError::Upstream("bad".into())),
             StatusCode::BAD_GATEWAY
-        );
-    }
-
-    #[test]
-    fn internal_error_returns_500() {
-        assert_eq!(
-            status_of(ProxyError::Internal("bad".into())),
-            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 

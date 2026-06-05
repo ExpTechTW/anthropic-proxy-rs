@@ -22,6 +22,13 @@ use tower_http::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+/// Build version: the CI-injected date-based version (`BUILD_VERSION`) when present,
+/// otherwise the crate version from `Cargo.toml`.
+pub const VERSION: &str = match option_env!("BUILD_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -117,7 +124,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("Starting Anthropic Proxy v{}", env!("CARGO_PKG_VERSION"));
+    tracing::info!("Starting Anthropic Proxy v{}", VERSION);
     tracing::info!("Bind: {}", config.bind);
     tracing::info!("Port: {}", config.port);
     tracing::info!("Upstream URLs: {}", config.upstream_urls.join("; "));

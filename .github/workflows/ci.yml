@@ -1,31 +1,281 @@
-name: CI
+name: CI & Release
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - release
   pull_request:
-    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-artifacts-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - name: Compute release version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="$(python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+          from datetime import datetime, timezone
+
+          token = os.environ.get("GH_TOKEN", "").strip()
+          repo = os.environ.get("GH_REPO", "").strip()
+          if not token or not repo:
+              raise SystemExit("missing GH_TOKEN or GH_REPO")
+
+          # Date-based version; the build counter resets to 1 each UTC day.
+          day = datetime.now(timezone.utc).strftime("%Y.%m.%d")
+          max_n = 0
+          page = 1
+          pat = re.compile(rf"^v{re.escape(day)}\+build\.(\d+)$")
+
+          while page <= 5:
+              url = f"https://api.github.com/repos/{repo}/releases?per_page=100&page={page}"
+              req = urllib.request.Request(url)
+              req.add_header("Accept", "application/vnd.github+json")
+              req.add_header("Authorization", f"Bearer {token}")
+              with urllib.request.urlopen(req, timeout=10) as resp:
+                  data = json.loads(resp.read().decode("utf-8"))
+              if not data:
+                  break
+              for rel in data:
+                  tag = (rel.get("tag_name") or "").strip()
+                  m = pat.match(tag)
+                  if m:
+                      max_n = max(max_n, int(m.group(1)))
+              page += 1
+
+          print(f"{day}+build.{max_n + 1}")
+          PY
+          )"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Decide release mode by branch and event
+        id: mode
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          # pull_request events only build & test — they never publish a release.
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            echo "mode=none" >> "$GITHUB_OUTPUT"
+          elif [[ "$BRANCH_NAME" == "main" ]]; then
+            echo "mode=pre-release" >> "$GITHUB_OUTPUT"
+          elif [[ "$BRANCH_NAME" == "release" ]]; then
+            echo "mode=release" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=none" >> "$GITHUB_OUTPUT"
+          fi
+
   check:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: check
+          cache-on-failure: true
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+
+  build:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static musl binaries run on any Linux distro (glibc or musl).
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - name: macos-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Per-target cache (artifacts differ by target); persist even on failure.
+          shared-key: build-${{ matrix.target }}
+          cache-on-failure: true
 
-      - name: Format
-        run: cargo fmt --check
+      - name: Install musl tools
+        if: endsWith(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Build
+        env:
+          BUILD_VERSION: ${{ needs.meta.outputs.version }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Test
-        run: cargo test
+      - name: Package
+        run: |
+          BIN=anthropic-proxy
+          DIR="target/${{ matrix.target }}/release"
+          tar -C "$DIR" -czf "${BIN}-${{ matrix.target }}.tar.gz" "$BIN"
+          shasum -a 256 "${BIN}-${{ matrix.target }}.tar.gz" > "${BIN}-${{ matrix.target }}.tar.gz.sha256"
+
+      - name: Upload artifacts
+        if: needs.meta.outputs.mode != 'none'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: |
+            anthropic-proxy-${{ matrix.target }}.tar.gz
+            anthropic-proxy-${{ matrix.target }}.tar.gz.sha256
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [meta, check, build]
+    if: needs.meta.outputs.mode != 'none'
+    steps:
+      - name: Checkout (for commit notes)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Prepare release notes
+        env:
+          GH_REPO: ${{ github.repository }}
+          MODE: ${{ needs.meta.outputs.mode }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          from collections import OrderedDict
+
+          repo = os.environ["GH_REPO"]
+          repo_url = f"https://github.com/{repo}"
+          mode = os.environ.get("MODE", "")
+          version = os.environ.get("VERSION", "")
+          before = os.environ.get("BEFORE_SHA", "").strip()
+          after = os.environ.get("AFTER_SHA", "").strip()
+
+          zero = "0" * 40
+          rev_range = f"{before}..{after}" if before and before != zero else after
+
+          proc = subprocess.run(
+              ["git", "log", "--pretty=format:%H%x1f%s", rev_range],
+              check=False, text=True, capture_output=True,
+          )
+          raw = [line for line in proc.stdout.splitlines() if line.strip()]
+
+          buckets = OrderedDict([
+              ("feat", "Features"), ("fix", "Fixes"), ("refactor", "Refactors"),
+              ("perf", "Performance"), ("docs", "Docs"), ("test", "Tests"),
+              ("chore", "Chores"), ("ci", "CI"), ("build", "Build"), ("other", "Other"),
+          ])
+          grouped = {k: [] for k in buckets}
+          type_re = re.compile(r"^([A-Za-z]+)(\([^)]+\))?:\s+")
+
+          for line in raw:
+              full_sha, subject = line.split("\x1f", 1)
+              subject = subject.strip()
+              m = type_re.match(subject)
+              ctype = m.group(1).lower() if m else "other"
+              if ctype not in grouped:
+                  ctype = "other"
+              grouped[ctype].append(
+                  f"- {subject} ([`{full_sha[:8]}`]({repo_url}/commit/{full_sha}))"
+              )
+
+          lines = [
+              "## Release", f"- Mode: `{mode}`", f"- Version: `v{version}`",
+              f"- Commit: `{after}`", "",
+          ]
+          if before and before != zero:
+              lines.append(f"- Compare: {repo_url}/compare/{before}...{after}")
+              lines.append("")
+
+          lines.append("## Changes")
+          has_changes = False
+          for key, title in buckets.items():
+              if grouped[key]:
+                  has_changes = True
+                  lines.append(f"### {title}")
+                  lines.extend(grouped[key])
+                  lines.append("")
+          if not has_changes:
+              lines.append("- No commits found in this range.")
+              lines.append("")
+
+          with open("release-notes.md", "w", encoding="utf-8") as f:
+              f.write("\n".join(lines))
+          PY
+
+      - name: Publish / update release
+        if: needs.meta.outputs.mode == 'release'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: v${{ needs.meta.outputs.version }}
+          commit: ${{ github.sha }}
+          name: v${{ needs.meta.outputs.version }} Release (auto)
+          bodyFile: release-notes.md
+          draft: false
+          prerelease: false
+          allowUpdates: true
+          replacesArtifacts: true
+          removeArtifacts: true
+          artifactErrorsFailBuild: true
+          artifacts: "dist/*"
+
+      - name: Publish / update pre-release
+        if: needs.meta.outputs.mode == 'pre-release'
+        uses: ncipollo/release-action@v1
+        with:
+          tag: v${{ needs.meta.outputs.version }}
+          commit: ${{ github.sha }}
+          name: v${{ needs.meta.outputs.version }} Pre-release (auto)
+          bodyFile: release-notes.md
+          draft: false
+          prerelease: true
+          allowUpdates: true
+          replacesArtifacts: true
+          removeArtifacts: true
+          artifactErrorsFailBuild: true
+          artifacts: "dist/*"

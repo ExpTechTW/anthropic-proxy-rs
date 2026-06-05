@@ -1,48 +1,66 @@
 # anthropic-proxy-rs
 
-High-performance Rust proxy that translates Anthropic API requests to OpenAI-compatible format. Use Claude Code, Claude Desktop, or any Anthropic API client with OpenRouter, native OpenAI, or any OpenAI-compatible endpoint.
+**English** · [繁體中文](README.zh-TW.md)
+
+[![CI & Release](https://github.com/ExpTechTW/anthropic-proxy-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/ExpTechTW/anthropic-proxy-rs/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/ExpTechTW/anthropic-proxy-rs?sort=date)](https://github.com/ExpTechTW/anthropic-proxy-rs/releases)
+
+High-performance Rust proxy that translates the **Anthropic Messages API** into the **OpenAI Chat Completions** format. Point Claude Code, Claude Desktop, or any Anthropic API client at OpenRouter, native OpenAI, Azure OpenAI, or any OpenAI-compatible endpoint (vLLM, Ollama, LM Studio, a private gateway, …).
+
+> Fork of [m0n0x41d/anthropic-proxy-rs](https://github.com/m0n0x41d/anthropic-proxy-rs) maintained by [ExpTech](https://github.com/ExpTechTW). Adds `tool_choice` / `metadata` / `refusal` support, a `count_tokens` endpoint, upstream status-code preservation, and connection-stability hardening.
 
 ## Features
 
-- **Fast & Lightweight**: Written in Rust with async I/O (~3MB binary)
-- **Full Streaming**: Server-Sent Events (SSE) with real-time responses
-- **Tool Calling**: Complete support for function/tool calling
-- **Universal**: Works with any OpenAI-compatible API (OpenRouter, OpenAI, Azure, local LLMs)
-- **Extended Thinking**: Supports Claude's reasoning mode
-- **Drop-in Replacement**: Compatible with official Anthropic SDKs
+- **Fast & lightweight** — Rust with async I/O (~3 MB binary)
+- **Full streaming** — Server-Sent Events (SSE) with real-time responses
+- **Tool calling** — function/tool calling incl. `tool_choice`
+- **Universal** — any OpenAI-compatible API (OpenRouter, OpenAI, Azure, local LLMs)
+- **Extended thinking** — detects Claude's reasoning mode and routes models accordingly
+- **Resilient** — retries transient failures, preserves upstream status codes, 600 s request timeout
+- **Drop-in** — works with the official Anthropic SDKs and Claude Code
+
+## Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/messages` | Main completion endpoint (streaming + non-streaming). Also accepts a trailing slash. |
+| `POST` | `/v1/messages/count_tokens` | Token count — exact via the upstream `/tokenize` when enabled, otherwise a local BPE estimate |
+| `GET`  | `/v1/models` | Lists models reported by the upstream, translated to Anthropic shape |
+| `GET`  | `/health` | Liveness check (`OK`) |
+| `GET`  | `/metrics` | Prometheus metrics |
+
+## Download
+
+Prebuilt binaries are published to [GitHub Releases](https://github.com/ExpTechTW/anthropic-proxy-rs/releases) for:
+
+| Platform | Asset |
+|----------|-------|
+| Linux x86_64 (static musl) | `anthropic-proxy-x86_64-unknown-linux-musl.tar.gz` |
+| Linux arm64 (static musl) | `anthropic-proxy-aarch64-unknown-linux-musl.tar.gz` |
+| macOS arm64 (Apple Silicon) | `anthropic-proxy-aarch64-apple-darwin.tar.gz` |
+
+```bash
+# Linux x86_64 — latest full release
+curl -fsSL https://github.com/ExpTechTW/anthropic-proxy-rs/releases/latest/download/anthropic-proxy-x86_64-unknown-linux-musl.tar.gz \
+  | tar -xz && ./anthropic-proxy --version
+```
+
+Each asset has a matching `.sha256` for verification. Linux binaries are statically linked (musl) and run on any distribution.
+
+**Release channels & versioning** — versions are date-based: `vYYYY.MM.DD+build.N`, where `N` resets to `1` each UTC day.
+
+- Pushes to **`main`** publish a **pre-release** (`… Pre-release (auto)`).
+- Pushes to **`release`** publish a **full release** (`… Release (auto)`) — this is what `releases/latest` resolves to.
 
 ## Quick Start
-
-> **Note**: Using [Task](https://taskfile.dev) is currently recommended. Install with `brew install go-task` (macOS) or see the [installation guide](https://taskfile.dev/installation/). Releases with build binaries will be made soon.
-
 
 ```bash
 # Install Rust (if needed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-### Build and install to PATH with task
+### Build and run
 
-```bash
-task local-install
-```
-
-### Install with curl
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/m0n0x41d/anthropic-proxy-rs/main/install.sh | bash
-```
-
-This installer uses `cargo install --git ... --locked` under the hood, so Rust/Cargo still needs to be present on the machine.
-
-# Run from anywhere
-```bash
-UPSTREAM_BASE_URL=https://openrouter.ai/api \
-UPSTREAM_API_KEY=sk-or-... \
-anthropic-proxy
-```
-
-# Or build and run manually
 ```bash
 cargo build --release
 UPSTREAM_BASE_URL=https://api.openai.com \
@@ -50,231 +68,263 @@ UPSTREAM_API_KEY=sk-... \
 ./target/release/anthropic-proxy
 ```
 
+### Install with Cargo
+
+```bash
+cargo install --git https://github.com/ExpTechTW/anthropic-proxy-rs --locked
+```
+
+### Run from anywhere
+
+```bash
+UPSTREAM_BASE_URL=https://openrouter.ai/api \
+UPSTREAM_API_KEY=sk-or-... \
+anthropic-proxy
+```
+
+### Docker
+
+The repository's [`Dockerfile`](Dockerfile) **downloads a prebuilt release binary** — no Rust toolchain, fast builds. Choose the channel with build args:
+
+```bash
+# Latest full release (default)
+docker build -t anthropic-proxy .
+
+# Latest pre-release (main-branch builds)
+docker build -t anthropic-proxy --build-arg CHANNEL=prerelease .
+
+# Pin an exact tag (overrides CHANNEL; works for pre-releases too)
+docker build -t anthropic-proxy --build-arg VERSION=v2026.06.05+build.3 .
+
+# Multi-arch
+docker buildx build --platform linux/amd64,linux/arm64 -t anthropic-proxy .
+
+docker run -p 3000:3000 \
+  -e UPSTREAM_BASE_URL=https://openrouter.ai/api \
+  -e UPSTREAM_API_KEY=sk-or-... \
+  anthropic-proxy
+```
+
+| Build arg | Default | Meaning |
+|-----------|---------|---------|
+| `CHANNEL` | `release` | `release` = latest full release · `prerelease` = latest pre-release |
+| `VERSION` | (empty) | Pin an exact tag, e.g. `v2026.06.05+build.3` (overrides `CHANNEL`) |
+
+To compile from source instead, use [`Dockerfile.source`](Dockerfile.source):
+
+```bash
+docker build -f Dockerfile.source -t anthropic-proxy .
+```
+
+## Use with Claude Code
+
+```bash
+# Start the proxy as a daemon and launch Claude Code against it
+anthropic-proxy --daemon && ANTHROPIC_BASE_URL=http://localhost:3000 claude
+
+# Or in separate terminals:
+anthropic-proxy                                   # terminal 1
+ANTHROPIC_BASE_URL=http://localhost:3000 claude   # terminal 2
+```
+
+### Recommended `settings.json`
+
+When your upstream model's context window is **smaller** than the Claude model name implies (e.g. a 105 K-token backend mapped to `claude-sonnet-4-5`, which Claude Code assumes is 200 K/1 M), Claude Code won't auto-compact until *far* past the real limit — and every request then fails with `context length exceeded`. Tell it the real window:
+
+Copy [`examples/claude-code-settings.json`](examples/claude-code-settings.json) into your Claude Code settings (`~/.claude/settings.json`, or a project-level `.claude/settings.json`):
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://your-proxy.example.com",
+    "ANTHROPIC_AUTH_TOKEN": "<your-upstream-api-key>",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "105120",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"
+  },
+  "model": "claude-sonnet-4-5"
+}
+```
+
+| Key | Why it matters |
+|-----|----------------|
+| `ANTHROPIC_BASE_URL` | Your proxy's URL. |
+| `ANTHROPIC_AUTH_TOKEN` | Sent as `x-api-key`; becomes the upstream key when the proxy runs in passthrough mode. |
+| **`CLAUDE_CODE_AUTO_COMPACT_WINDOW`** | **Set to the upstream model's real context window** (in tokens). This is the value auto-compaction is calculated against — without it, Claude Code uses the model-name default and compacts too late. |
+| **`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`** | Compact at this % of the window (default is ~95 %). `75` leaves comfortable headroom for the response. |
+
+> ⚠️ **Do not use `CLAUDE_CODE_MAX_CONTEXT_TOKENS` for this** — per the [Claude Code docs](https://code.claude.com/docs/en/env-vars) it only takes effect together with `DISABLE_COMPACT`. The variable that actually drives auto-compaction is `CLAUDE_CODE_AUTO_COMPACT_WINDOW`.
+>
+> If `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` appears to be ignored from `settings.json`, set it as a shell environment variable instead ([known issue](https://github.com/anthropics/claude-code/issues/63186)).
+
+Verify with `/context` — it should report your real window (e.g. `30.6k / 105.1k`) and an `Auto-compact window` line.
+
 ## Configuration
 
-### Command Line Options
+### Command-line options
 
 ```bash
 anthropic-proxy --help
 ```
 
-**Commands:**
+**Commands**
+
 | Command | Description |
 |---------|-------------|
-| `stop` | Stop running daemon |
+| `stop` | Stop a running daemon |
 | `status` | Check daemon status |
 
-**Options:**
+**Options**
+
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--config <FILE>` | `-c` | Path to custom .env file |
+| `--config <FILE>` | `-c` | Path to a custom `.env` file |
 | `--debug` | `-d` | Enable debug logging |
-| `--verbose` | `-v` | Enable verbose logging (logs full request/response bodies) |
-| `--port <PORT>` | `-p` | Port to listen on (overrides PORT env var) |
-| `--bind <ADDR>` | | Address to bind the listener to (overrides `ANTHROPIC_PROXY_BIND`, default `0.0.0.0`) |
-| `--system-prompt-ignore <TEXT>` | | Remove one or more system prompt terms before forwarding upstream (repeat or separate with `;`) |
-| `--daemon` | | Run as background daemon |
-| `--pid-file <FILE>` | | PID file path (default: `/tmp/anthropic-proxy.pid`) |
-| `--help` | `-h` | Print help information |
+| `--verbose` | `-v` | Verbose logging (logs full request/response bodies) |
+| `--port <PORT>` | `-p` | Port to listen on (overrides `PORT`) |
+| `--bind <ADDR>` | | Listener bind address (overrides `ANTHROPIC_PROXY_BIND`, default `0.0.0.0`) |
+| `--system-prompt-ignore <TEXT>` | | Remove system-prompt terms before forwarding (repeat or separate with `;`) |
+| `--daemon` | | Run as a background daemon |
+| `--pid-file <FILE>` | | PID file path (default `/tmp/anthropic-proxy.pid`) |
+| `--help` | `-h` | Print help |
 | `--version` | `-V` | Print version |
 
-### Environment Variables
+### Environment variables
 
-Configuration can be set via environment variables or `.env` file:
+Set via environment or a `.env` file:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `UPSTREAM_BASE_URL` | **Yes** | - | OpenAI-compatible endpoint URL |
-| `UPSTREAM_API_KEY` | No* | - | API key for upstream service |
-| `UPSTREAM_API_KEY_PASSTHROUGH` | No | `false` | Extract API key from incoming `x-api-key` header per request (`true`/`false`) |
+| `UPSTREAM_BASE_URL` | **Yes** | – | OpenAI-compatible endpoint URL |
+| `UPSTREAM_API_KEY` | No\* | – | API key for the upstream service |
+| `UPSTREAM_API_KEY_PASSTHROUGH` | No | `false` | Take the API key from each request's `x-api-key` header (`true`/`false`) |
 | `PORT` | No | `3000` | Server port |
-| `ANTHROPIC_PROXY_BIND` | No | `0.0.0.0` | Listener bind address. Set to `127.0.0.1` to restrict access to localhost (recommended on shared networks). When bound to `0.0.0.0`, a warning is logged. |
-| `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS` | No | - | System prompt terms to remove before forwarding upstream (`;` or newline separated) |
-| `ANTHROPIC_PROXY_MODEL_MAP` | No | - | Exact model remapping before the upstream call (`source=target;other=target`) |
-| `REASONING_MODEL` | No | (uses request model) | Model to use when extended thinking is enabled** |
-| `COMPLETION_MODEL` | No | (uses request model) | Model to use for standard requests (no thinking)** |
-| `DEBUG` | No | `false` | Enable debug logging (`1` or `true`) |
-| `VERBOSE` | No | `false` | Enable verbose logging (`1` or `true`) |
+| `ANTHROPIC_PROXY_BIND` | No | `0.0.0.0` | Bind address. Use `127.0.0.1` to restrict to localhost. Binding to `0.0.0.0` logs a warning. |
+| `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS` | No | – | System-prompt terms to remove before forwarding (`;` or newline separated) |
+| `ANTHROPIC_PROXY_MODEL_MAP` | No | – | Exact model remapping before the upstream call (`source=target;other=target`) |
+| `ANTHROPIC_PROXY_UPSTREAM_TOKENIZE` | No | `false` | Use the upstream's vLLM-style `/tokenize` for **exact** `count_tokens` and accurate overflow clamping, instead of a local estimate |
+| `REASONING_MODEL` | No | (request model) | Model used when extended thinking is enabled\*\* |
+| `COMPLETION_MODEL` | No | (request model) | Model used for standard requests (no thinking)\*\* |
+| `DEBUG` | No | `false` | Debug logging (`1` or `true`) |
+| `VERBOSE` | No | `false` | Verbose logging (`1` or `true`) |
 
-\* Required if your upstream endpoint needs authentication  
-\*\* The proxy automatically detects when a request has extended thinking enabled (via the `thinking` parameter in the request) and routes it to `REASONING_MODEL`. Standard requests without thinking use `COMPLETION_MODEL`. This allows you to use more powerful models for reasoning tasks and faster/cheaper models for simple completions. If not set, the model from the client request is used.
+\* Required if your upstream endpoint needs authentication.
+\*\* The proxy detects when a request enables extended thinking (the `thinking` parameter) and routes it to `REASONING_MODEL`; requests without thinking use `COMPLETION_MODEL`. If neither is set, the model from the client request is used. `ANTHROPIC_PROXY_MODEL_MAP` is applied **after** this selection.
 
 `UPSTREAM_BASE_URL` accepts any of these forms:
-- Service base URL: `https://api.openai.com` -> `/v1/chat/completions`
-- Versioned base URL: `https://gateway.company.internal/v2` -> `/v2/chat/completions`
-- Full endpoint: `https://gateway.company.internal/v2/chat/completions`
+- Service base URL: `https://api.openai.com` → `/v1/chat/completions`
+- Versioned base URL: `https://gateway.company.internal/v2` → `/v2/chat/completions`
+- Full endpoint: `https://gateway.company.internal/v2/chat/completions` → used as-is
 
-System prompt sanitization:
-- The proxy can remove configured terms from upstream `system` prompts before forwarding.
-- Set terms with `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS='rm -rf;git reset --hard'`
-- Or repeat `--system-prompt-ignore`, for example `--system-prompt-ignore 'rm -rf' --system-prompt-ignore 'git reset --hard'`
+### Configuration file locations
 
-Model mapping:
-- `ANTHROPIC_PROXY_MODEL_MAP='claude-opus-4-6=openai/gpt-4.1;claude-haiku-4-5=openai/gpt-4.1-mini'`
-- `REASONING_MODEL` and `COMPLETION_MODEL` are selected first, then `ANTHROPIC_PROXY_MODEL_MAP` is applied to the final model name before the upstream call
+The proxy searches for a `.env` file in this order:
 
-### Configuration File Locations
-
-The proxy searches for `.env` files in the following order:
-
-1. Custom path specified with `--config` flag
+1. Custom path from `--config`
 2. Current working directory (`./.env`)
-3. User home directory (`~/.anthropic-proxy.env`)
-4. System-wide config (`/etc/anthropic-proxy/.env`)
+3. Home directory (`~/.anthropic-proxy.env`)
+4. System-wide (`/etc/anthropic-proxy/.env`)
 
-If no `.env` file is found, the proxy uses environment variables from your shell.
+If none is found, environment variables from your shell are used.
 
-### API Key Passthrough
+### API key passthrough
 
-When `UPSTREAM_API_KEY_PASSTHROUGH=true` is set, the proxy extracts the API key from each incoming request's `x-api-key` header (the standard header used by Anthropic SDKs and clients) and forwards it as `Authorization: Bearer {key}` to the upstream OpenAI-compatible endpoint.
-
-This is useful when you want each client to authenticate with its own key to the upstream service, rather than using a single static key configured in `UPSTREAM_API_KEY`.
+With `UPSTREAM_API_KEY_PASSTHROUGH=true`, the proxy reads each request's `x-api-key` header (the standard Anthropic-client header) and forwards it as `Authorization: Bearer {key}` upstream — so every client authenticates with its own key instead of one static `UPSTREAM_API_KEY`.
 
 ```bash
-# Enable passthrough mode (UPSTREAM_API_KEY must NOT be set)
+# Passthrough mode (UPSTREAM_API_KEY must NOT be set)
 UPSTREAM_API_KEY_PASSTHROUGH=true \
 UPSTREAM_BASE_URL=https://openrouter.ai/api \
 anthropic-proxy
 ```
 
-**Important constraints:**
-- `UPSTREAM_API_KEY_PASSTHROUGH=true` **cannot** be combined with `UPSTREAM_API_KEY`. If both are set, the proxy will refuse to start.
-- If passthrough is enabled but the incoming request has no `x-api-key` header (or an empty one), no `Authorization` header is sent upstream — the upstream endpoint decides whether to accept unauthenticated requests.
-- Passthrough applies to both `/v1/messages` and `/v1/models` endpoints, as both receive the `x-api-key` header from Anthropic clients.
+Constraints:
+- Cannot be combined with `UPSTREAM_API_KEY` — if both are set the proxy refuses to start.
+- If passthrough is on and a request has no (or an empty) `x-api-key`, no `Authorization` header is sent upstream; the upstream decides whether to accept it.
 
-## Usage Examples
-
-### With Claude Code
+### Model mapping
 
 ```bash
-# Start proxy as daemon and use Claude Code immediately
-anthropic-proxy --daemon && ANTHROPIC_BASE_URL=http://localhost:3000 claude
-
-# Or use separate terminals:
-# Terminal 1: Start proxy
-anthropic-proxy
-
-# Terminal 2: Use Claude Code
-ANTHROPIC_BASE_URL=http://localhost:3000 claude
+ANTHROPIC_PROXY_MODEL_MAP='claude-opus-4-7=openai/gpt-4.1;claude-haiku-3-5=openai/gpt-4.1-mini'
 ```
 
-### With Debug Logging
+### System-prompt sanitization
+
+Remove configured terms from `system` prompts before forwarding (useful when a gateway/WAF blocks certain phrases):
 
 ```bash
-# Enable debug logging via CLI flag
-anthropic-proxy --debug
-
-# Or via environment variable
-DEBUG=true anthropic-proxy
-
-# Enable verbose logging (logs full request/response bodies)
-anthropic-proxy --verbose
-```
-
-### With System Prompt Ignore Terms
-
-```bash
-# Remove specific terms via environment variable
 ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS='rm -rf;git reset --hard' anthropic-proxy
-
-# Or via CLI flag
-anthropic-proxy \
-  --system-prompt-ignore 'rm -rf' \
-  --system-prompt-ignore 'git reset --hard'
+# or
+anthropic-proxy --system-prompt-ignore 'rm -rf' --system-prompt-ignore 'git reset --hard'
 ```
 
-### With Custom Config File
+### Running as a daemon
 
 ```bash
-# Use a custom .env file
-anthropic-proxy --config /path/to/my-config.env
-
-# Or place it in your home directory
-cp .env ~/.anthropic-proxy.env
-anthropic-proxy
-```
-
-### With Custom Model Overrides
-
-```bash
-# Use different models for reasoning vs standard completion
-# Reasoning model is used when extended thinking is enabled in the request
-# Completion model is used for standard requests without thinking
-UPSTREAM_BASE_URL=https://openrouter.ai/api \
-  UPSTREAM_API_KEY=sk-or-... \
-  REASONING_MODEL=anthropic/claude-3.5-sonnet \
-  COMPLETION_MODEL=anthropic/claude-3-haiku \
-  PORT=8080 \
-  anthropic-proxy
-
-# This allows cost optimization: use powerful models for complex reasoning,
-# and faster/cheaper models for simple completions
-```
-
-### Running as Daemon
-
-```bash
-# Start as background daemon
-anthropic-proxy --daemon
-
-# Check daemon status
-anthropic-proxy status
-
-# Stop daemon
-anthropic-proxy stop
-
-# View daemon logs
-tail -f /tmp/anthropic-proxy.log
-
-# Custom PID file location
-anthropic-proxy --daemon --pid-file ~/.anthropic-proxy.pid
-anthropic-proxy stop --pid-file ~/.anthropic-proxy.pid
-```
-
-> **Note**: When running as daemon, logs are written to `/tmp/anthropic-proxy.log`
-
-### With Model Mapping
-
-```bash
-UPSTREAM_BASE_URL=https://gateway.company.internal/v2 \
-  UPSTREAM_API_KEY=sk-... \
-  ANTHROPIC_PROXY_MODEL_MAP='claude-opus-4-6=openai/gpt-4.1;claude-haiku-4-5=openai/gpt-4.1-mini' \
-  anthropic-proxy
+anthropic-proxy --daemon            # start
+anthropic-proxy status              # check
+anthropic-proxy stop                # stop
+tail -f /tmp/anthropic-proxy.log    # logs
 ```
 
 ## Supported Features
 
-✅ Text messages  
-✅ System prompts (single and multiple)  
-✅ Image content (base64)  
-✅ Tool/function calling  
-✅ Tool results  
-✅ Streaming responses  
-✅ Extended thinking mode (automatic model routing)  
-✅ Temperature, top_p, top_k  
-✅ Stop sequences  
-✅ Max tokens  
-✅ `tool_choice` (`auto`/`any`/`tool`/`none`, incl. `disable_parallel_tool_use`)  
-✅ `metadata.user_id` (forwarded as OpenAI `user`)  
-✅ `refusal` stop reason (mapped from upstream `content_filter`)  
-✅ `POST /v1/messages/count_tokens` (local heuristic estimate — upstreams expose no count endpoint)  
+✅ Text messages
+✅ System prompts (single and multiple)
+✅ Image content (base64)
+✅ Tool/function calling + tool results (multi-turn `tool_use` ↔ `tool_result` round-trip)
+✅ `tool_choice` — `auto` / `any` / `tool` / `none`, incl. `disable_parallel_tool_use`
+✅ Streaming responses (SSE; handles `\n\n` and `\r\n\r\n` framing)
+✅ Extended thinking (automatic model routing; `reasoning_content` preserved in both streaming and non-streaming)
+✅ `metadata.user_id` (forwarded as OpenAI `user`)
+✅ `refusal` stop reason (mapped from upstream `content_filter`)
+✅ Stop sequences, `max_tokens`, `temperature`, `top_p`
+✅ `POST /v1/messages/count_tokens` — exact via the upstream `/tokenize` (when `ANTHROPIC_PROXY_UPSTREAM_TOKENIZE=true`), else a local BPE estimate; also accepts `?beta=true`
+✅ Streaming usage — real `input_tokens` / `output_tokens` / `cache_read_input_tokens` surfaced in `message_delta` (captured from the upstream's final usage chunk), with an upfront estimate in `message_start`
+✅ Prompt-cache token accounting — upstream `prompt_tokens_details.cached_tokens` is reported as Anthropic `cache_read_input_tokens` (and excluded from `input_tokens`), so Claude Code's cache/cost stats are accurate
 
-> **Note**: Make sure your upstream model supports tool use. Especially if you are using this proxy for coding agents like Claude Code.
+> `top_k` is accepted but not forwarded — Chat Completions has no equivalent.
+>
+> **Note:** Make sure your upstream model supports tool use, especially for coding agents like Claude Code.
 
-### Reliability
+## Reliability
 
-- **Upstream status codes are preserved.** A client error (e.g. `400` invalid request, `403`/`404`, `429` rate limit) is surfaced with its original status and an Anthropic-shaped error body (`{"type":"error","error":{"type":...,"message":...}}`), not masked as a generic `502`. Only genuine transport failures map to `502`.
-- **Transient failures are retried.** Connection/timeout/body errors retry up to 3× per upstream with a fresh connection; idle pooled connections are kept short-lived to avoid stale-socket `502`s under load.
-- **Request timeout is 600s**, matching a typical fronting nginx `proxy_read_timeout`, so long generations/streams are not cut short.
+- **Upstream status codes are preserved.** A client error (`400` invalid request, `401`/`403`/`404`, `413`, `429` rate limit) is surfaced with its original status and an Anthropic-shaped error body — `{"type":"error","error":{"type":...,"message":...}}` — instead of being masked as a generic `502`. Only genuine transport failures (no HTTP response) map to `502`.
+- **Transient failures are retried.** Connection / timeout / body-read errors and retriable statuses (`429`, `5xx`) are retried up to 3× per upstream URL with a fresh connection.
+- **Context-overflow auto-recovery.** If the upstream rejects a request because `input + max_tokens` exceeds the model's context window, the proxy re-tokenizes the actual request to learn the true input size (taking the larger of that and the error's own lower bound, so it always converges), clamps `max_tokens` to fit, and retries — so a conversation that's *just* over the limit (and even Claude Code's `/compact`, which otherwise dead-locks because it also requests output) completes instead of hard-failing on a `400`.
+- **Stale-connection hardening.** Pooled idle connections are kept short-lived with TCP keep-alive, eliminating the intermittent `502`s caused by reusing a socket the upstream silently closed.
+- **600 s request timeout**, matching a typical fronting nginx `proxy_read_timeout`, so long generations and streams are not cut short.
 
-### Extended Thinking Mode
+## Behind a reverse proxy (nginx)
 
-The proxy automatically detects when a request includes the `thinking` parameter (Claude Codes's for example) and routes it to the model specified in `REASONING_MODEL`. Requests without thinking use `COMPLETION_MODEL`. 
+When running this proxy behind nginx/OpenResty, for the location that forwards to it:
 
-If model override variables are not set, the proxy uses the model specified in the client request.
+```nginx
+location / {
+    proxy_pass http://anthropic-proxy:3000;
+
+    # SSE streaming
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_request_buffering off;
+
+    # Let the proxy's JSON error bodies pass through unchanged
+    proxy_intercept_errors off;
+
+    # Align with the proxy's 600 s request timeout
+    proxy_read_timeout 600s;
+    proxy_send_timeout 600s;
+    send_timeout 600s;
+}
+```
+
+- Keep **`proxy_intercept_errors off`** so the proxy's Anthropic-shaped JSON errors reach the client (otherwise `error_page` replaces them with plain text).
+- Keep **buffering off** for streaming.
+- Align timeouts to **600 s** (or raise the proxy's accordingly) so neither side truncates long responses.
 
 ## Known Limitations
-The following Anthropic API features are **not supported** currently (Claude Code and similar tools working without these parameters):
+
+The following Anthropic API features are **not supported** (Claude Code and similar tools work fine without them):
 
 - `service_tier` parameter (no portable OpenAI-compatible equivalent)
 - `context_management` parameter (Anthropic server-side feature; no upstream equivalent)
@@ -285,42 +335,31 @@ The following Anthropic API features are **not supported** currently (Claude Cod
 - Files API
 - Admin API
 
-## Troubleshooting & Known Pitfalls
+Without `ANTHROPIC_PROXY_UPSTREAM_TOKENIZE`, `count_tokens` returns a **local BPE estimate** rather than an exact count. Enable it to get exact counts from a vLLM-style `/tokenize` endpoint.
 
-**Error: `UPSTREAM_BASE_URL is required`**  
-→ You must set the upstream endpoint URL. Examples:
-  - OpenRouter: `https://openrouter.ai/api`
-  - OpenAI: `https://api.openai.com`
-  - Local: `http://localhost:11434`
+## Troubleshooting
 
-**Error: `405 Method Not Allowed` or wrong upstream path**  
-→ Check how `UPSTREAM_BASE_URL` is being resolved:
-  - `https://api.openai.com` -> `https://api.openai.com/v1/chat/completions`
-  - `https://openrouter.ai/api` -> `https://openrouter.ai/api/v1/chat/completions`
-  - `https://gateway.company.internal/v2` -> `https://gateway.company.internal/v2/chat/completions`
-  - `https://gateway.company.internal/v2/chat/completions` -> used as-is
-  - Partial paths like `.../chat` and URLs with query strings/fragments are rejected
+**`UPSTREAM_BASE_URL is required`** — set the upstream endpoint, e.g. `https://openrouter.ai/api`, `https://api.openai.com`, or `http://localhost:11434`.
 
-**Model not found errors**  
-→ Set `REASONING_MODEL` and `COMPLETION_MODEL` to override the models from client requests, or use `ANTHROPIC_PROXY_MODEL_MAP` to remap client model names to upstream model names
+**`405 Method Not Allowed` / wrong upstream path** — check how `UPSTREAM_BASE_URL` resolves (see the forms above). Partial paths like `.../chat` and URLs with query strings/fragments are rejected.
 
-**Gateway/WAF blocks Claude Code system prompts with `403`**
-→ Use `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS` or `--system-prompt-ignore` to remove offending terms before forwarding upstream
+**Model not found** — set `REASONING_MODEL` / `COMPLETION_MODEL`, or use `ANTHROPIC_PROXY_MODEL_MAP` to remap client model names to upstream ones. Ensure the model IDs you advertise to clients match the map keys.
+
+**Gateway/WAF blocks Claude Code prompts with `403`** — use `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS` / `--system-prompt-ignore` to strip offending terms.
+
+**Intermittent `502` under load** — ensure you are on a current build (stale-connection hardening + retries). If a 502 persists, the upstream itself returned a transport failure; check the proxy logs (`--debug`).
+
+## Development
+
+```bash
+cargo test          # unit tests
+cargo clippy        # lints
+cargo fmt           # formatting
+```
 
 ## License
 
-MIT License - Copyright (c) 2025 m0n0x41d (Ivan Zakutnii)
-
-See [LICENSE](LICENSE) for details.
-
-## Contributing
-
-Contributions welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run `cargo test && cargo clippy`
-5. Submit a pull request
+MIT License — Copyright (c) 2025 m0n0x41d (Ivan Zakutnii). Fork maintained by ExpTech. See [LICENSE](LICENSE).
 
 ## Links
 

@@ -20,35 +20,21 @@ pub fn translate_request(
     let mut openai_messages = Vec::new();
 
     if let Some(system) = req.system {
-        match system {
-            anthropic::SystemPrompt::Single(text) => {
-                openai_messages.push(openai::Message {
-                    role: "system".to_string(),
-                    content: Some(openai::MessageContent::Text(sanitize_prompt(
-                        text,
-                        &policy.ignore_terms,
-                    ))),
-                    reasoning_content: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                });
-            }
+        let texts = match system {
+            anthropic::SystemPrompt::Single(text) => vec![text],
             anthropic::SystemPrompt::Multiple(messages) => {
-                for msg in messages {
-                    openai_messages.push(openai::Message {
-                        role: "system".to_string(),
-                        content: Some(openai::MessageContent::Text(sanitize_prompt(
-                            msg.text,
-                            &policy.ignore_terms,
-                        ))),
-                        reasoning_content: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        name: None,
-                    });
-                }
+                messages.into_iter().map(|m| m.text).collect()
             }
+        };
+        for text in texts {
+            openai_messages.push(openai::Message {
+                role: "system".to_string(),
+                content: Some(openai::MessageContent::Text(sanitize_prompt(
+                    text,
+                    &policy.ignore_terms,
+                ))),
+                ..Default::default()
+            });
         }
     }
 
@@ -151,6 +137,7 @@ pub fn translate_response(
     }
 
     let stop_reason = core::map_stop_reason(choice.finish_reason.as_deref());
+    let (input_tokens, cache_read_input_tokens) = core::split_prompt_tokens(&resp.usage);
 
     Ok(anthropic::AnthropicResponse {
         id: resp.id.unwrap_or_else(|| "msg_proxy".to_string()),
@@ -161,69 +148,209 @@ pub fn translate_response(
         stop_reason,
         stop_sequence: None,
         usage: anthropic::Usage {
-            input_tokens: resp.usage.prompt_tokens,
+            input_tokens,
             output_tokens: resp.usage.completion_tokens,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens,
         },
     })
 }
 
-/// Estimate the input token count for a count-tokens request.
-///
-/// This is a heuristic (~4 UTF-8 bytes per token plus per-message overhead), not a
-/// real tokenizer — the OpenAI-compatible upstream exposes no count endpoint, so a
-/// stable ballpark is preferable to returning a 404 that breaks client context
-/// budgeting. Base64 image payloads are excluded so they don't inflate the count.
+/// Per-message chat-template overhead (e.g. qwen's `<|im_start|>role\n…<|im_end|>\n`
+/// plus the trailing assistant primer) in tokens. Measured at 8–10 across qwen models;
+/// we use the high end so the count is never below the upstream's real count.
+const PER_MESSAGE_OVERHEAD: usize = 10;
+
+/// Count the input tokens for a count-tokens request using a real BPE tokenizer
+/// (see [`estimate_text_tokens`]) plus small per-message overhead. Accurate token counts
+/// are what let Claude Code decide compaction at the right time; a rough heuristic
+/// under-counted code and made it compact too late. Base64 image payloads are excluded.
 pub fn estimate_input_tokens(req: &anthropic::CountTokensRequest) -> u32 {
-    let mut chars = 0usize;
+    let mut tokens = 0usize;
 
     if let Some(system) = &req.system {
         match system {
-            anthropic::SystemPrompt::Single(text) => chars += text.len(),
+            anthropic::SystemPrompt::Single(text) => tokens += estimate_text_tokens(text),
             anthropic::SystemPrompt::Multiple(messages) => {
                 for msg in messages {
-                    chars += msg.text.len();
+                    tokens += estimate_text_tokens(&msg.text);
                 }
             }
         }
     }
 
     for msg in &req.messages {
-        chars += msg.role.len();
-        chars += estimate_content_chars(&msg.content);
+        tokens += estimate_text_tokens(&msg.role);
+        tokens += estimate_content_tokens(&msg.content);
+        tokens += PER_MESSAGE_OVERHEAD;
     }
 
     if let Some(tools) = &req.tools {
         for tool in tools {
-            chars += tool.name.len();
+            tokens += estimate_text_tokens(&tool.name);
             if let Some(description) = &tool.description {
-                chars += description.len();
+                tokens += estimate_text_tokens(description);
             }
-            chars += tool.input_schema.to_string().len();
+            tokens += estimate_text_tokens(&tool.input_schema.to_string());
         }
     }
 
-    let overhead = req.messages.len().saturating_mul(4);
-    ((chars / 4) + overhead).max(1) as u32
+    // cl100k slightly under-counts the qwen-class upstreams on dense code (measured ~11%);
+    // a 1.15× safety factor keeps our count at or above the real one so Claude Code never
+    // under-estimates and compacts on time. Over-counting only triggers compaction a touch
+    // early — far cheaper than overflowing the window.
+    ((tokens * 23 / 20).max(1)) as u32
 }
 
-fn estimate_content_chars(content: &anthropic::MessageContent) -> usize {
+/// Heuristic input-token estimate for an already-translated OpenAI request. Used to fill
+/// `input_tokens` in the streaming `message_start` — the upstream only reports real usage
+/// in the final chunk (too late for message_start), but Claude Code reads input from
+/// message_start to track context. Mirrors [`estimate_input_tokens`], safety factor included.
+pub fn estimate_openai_input_tokens(req: &openai::OpenAIRequest) -> u32 {
+    let mut tokens = 0usize;
+
+    for msg in &req.messages {
+        tokens += estimate_text_tokens(&msg.role);
+        match &msg.content {
+            Some(openai::MessageContent::Text(text)) => tokens += estimate_text_tokens(text),
+            Some(openai::MessageContent::Parts(parts)) => {
+                for part in parts {
+                    if let openai::ContentPart::Text { text } = part {
+                        tokens += estimate_text_tokens(text);
+                    }
+                }
+            }
+            None => {}
+        }
+        if let Some(reasoning) = &msg.reasoning_content {
+            tokens += estimate_text_tokens(reasoning);
+        }
+        if let Some(tool_calls) = &msg.tool_calls {
+            for call in tool_calls {
+                tokens += estimate_text_tokens(&call.function.name);
+                tokens += estimate_text_tokens(&call.function.arguments);
+            }
+        }
+        tokens += PER_MESSAGE_OVERHEAD;
+    }
+
+    if let Some(tools) = &req.tools {
+        for tool in tools {
+            tokens += estimate_text_tokens(&tool.function.name);
+            if let Some(description) = &tool.function.description {
+                tokens += estimate_text_tokens(description);
+            }
+            tokens += estimate_text_tokens(&tool.function.parameters.to_string());
+        }
+    }
+
+    ((tokens * 23 / 20).max(1)) as u32
+}
+
+/// Concatenate all countable text (system + message content + tool schemas) into a
+/// single string for an upstream `/tokenize` call, returning it with the message count
+/// (used to add the per-message chat-template overhead). Base64 images are excluded.
+pub fn collect_tokenize_text(req: &anthropic::CountTokensRequest) -> (String, usize) {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(system) = &req.system {
+        match system {
+            anthropic::SystemPrompt::Single(text) => parts.push(text.clone()),
+            anthropic::SystemPrompt::Multiple(messages) => {
+                parts.extend(messages.iter().map(|m| m.text.clone()));
+            }
+        }
+    }
+
+    for msg in &req.messages {
+        parts.push(msg.role.clone());
+        collect_content_text(&msg.content, &mut parts);
+    }
+
+    if let Some(tools) = &req.tools {
+        for tool in tools {
+            parts.push(tool.name.clone());
+            if let Some(description) = &tool.description {
+                parts.push(description.clone());
+            }
+            parts.push(tool.input_schema.to_string());
+        }
+    }
+
+    (parts.join("\n"), req.messages.len())
+}
+
+fn collect_content_text(content: &anthropic::MessageContent, parts: &mut Vec<String>) {
     match content {
-        anthropic::MessageContent::Text(text) => text.len(),
-        anthropic::MessageContent::Blocks(blocks) => blocks.iter().map(estimate_block_chars).sum(),
+        anthropic::MessageContent::Text(text) => parts.push(text.clone()),
+        anthropic::MessageContent::Blocks(blocks) => {
+            for block in blocks {
+                match block {
+                    anthropic::ContentBlock::Text { text, .. } => parts.push(text.clone()),
+                    anthropic::ContentBlock::Thinking { thinking } => parts.push(thinking.clone()),
+                    anthropic::ContentBlock::ToolUse { name, input, .. } => {
+                        parts.push(name.clone());
+                        parts.push(input.to_string());
+                    }
+                    anthropic::ContentBlock::ToolResult { content, .. } => match content {
+                        anthropic::ToolResultContent::Text(text) => parts.push(text.clone()),
+                        anthropic::ToolResultContent::Blocks(blocks) => {
+                            for b in blocks {
+                                if let anthropic::ContentBlock::Text { text, .. } = b {
+                                    parts.push(text.clone());
+                                }
+                            }
+                        }
+                    },
+                    anthropic::ContentBlock::Image { .. } => {}
+                }
+            }
+        }
     }
 }
 
-fn estimate_block_chars(block: &anthropic::ContentBlock) -> usize {
+/// Per-message chat-template overhead in tokens, added on top of an exact upstream
+/// content count (and used by the heuristic estimate too).
+pub const PER_MESSAGE_OVERHEAD_TOKENS: u32 = PER_MESSAGE_OVERHEAD as u32;
+
+/// Lazily-initialized BPE tokenizer (cl100k_base). Shared across requests.
+fn tokenizer() -> Option<&'static tiktoken_rs::CoreBPE> {
+    static BPE: std::sync::OnceLock<Option<tiktoken_rs::CoreBPE>> = std::sync::OnceLock::new();
+    BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok()).as_ref()
+}
+
+/// Per-text token count via the cl100k BPE tokenizer — the same family the OpenAI
+/// ecosystem uses, far closer to reality than the old char heuristic that under-counted
+/// code (and made Claude Code compact too late and overflow). cl100k still runs ~10%
+/// under the qwen tokenizer on dense code, which the caller's safety factor offsets.
+/// This path is only the fallback for when the upstream `/tokenize` is unavailable.
+fn estimate_text_tokens(text: &str) -> usize {
+    match tokenizer() {
+        Some(bpe) => bpe.encode_ordinary(text).len(),
+        // cl100k is embedded and effectively never fails to load; this only guards a
+        // corrupt build, so a crude byte heuristic is plenty.
+        None => text.len() / 4,
+    }
+}
+
+fn estimate_content_tokens(content: &anthropic::MessageContent) -> usize {
+    match content {
+        anthropic::MessageContent::Text(text) => estimate_text_tokens(text),
+        anthropic::MessageContent::Blocks(blocks) => blocks.iter().map(estimate_block_tokens).sum(),
+    }
+}
+
+fn estimate_block_tokens(block: &anthropic::ContentBlock) -> usize {
     match block {
-        anthropic::ContentBlock::Text { text, .. } => text.len(),
-        anthropic::ContentBlock::Thinking { thinking } => thinking.len(),
+        anthropic::ContentBlock::Text { text, .. } => estimate_text_tokens(text),
+        anthropic::ContentBlock::Thinking { thinking } => estimate_text_tokens(thinking),
         anthropic::ContentBlock::ToolUse { name, input, .. } => {
-            name.len() + input.to_string().len()
+            estimate_text_tokens(name) + estimate_text_tokens(&input.to_string())
         }
         anthropic::ContentBlock::ToolResult { content, .. } => match content {
-            anthropic::ToolResultContent::Text(text) => text.len(),
+            anthropic::ToolResultContent::Text(text) => estimate_text_tokens(text),
             anthropic::ToolResultContent::Blocks(blocks) => {
-                blocks.iter().map(estimate_block_chars).sum()
+                blocks.iter().map(estimate_block_tokens).sum()
             }
         },
         // Image payloads (base64) are intentionally not counted — they would
@@ -772,6 +899,7 @@ mod tests {
                 prompt_tokens: 5,
                 completion_tokens: 1,
                 total_tokens: 6,
+                ..Default::default()
             },
             system_fingerprint: None,
         };
@@ -802,6 +930,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 2,
                 total_tokens: 12,
+                ..Default::default()
             },
             system_fingerprint: None,
         };
@@ -839,6 +968,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                ..Default::default()
             },
             system_fingerprint: None,
         };
@@ -999,6 +1129,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                ..Default::default()
             },
             system_fingerprint: None,
         };
@@ -1068,12 +1199,27 @@ mod tests {
                 "logprobs": null,
                 "message": {"role": "assistant", "content": "hi", "annotations": []}
             }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3,
-                      "prompt_tokens_details": {"cached_tokens": 1}}
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+                      "prompt_tokens_details": {"cached_tokens": 4}}
         }));
         let anthropic = translate_response(resp, "fallback").unwrap();
-        assert_eq!(anthropic.usage.input_tokens, 1);
+        // Cached tokens are split out: input = prompt(10) - cached(4), cache_read = 4.
+        assert_eq!(anthropic.usage.input_tokens, 6);
         assert_eq!(anthropic.usage.output_tokens, 2);
+        assert_eq!(anthropic.usage.cache_read_input_tokens, Some(4));
+    }
+
+    #[test]
+    fn response_without_cache_details_omits_cache_fields() {
+        let resp = parse_response(json!({
+            "id": "chatcmpl-1",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 2, "total_tokens": 9}
+        }));
+        let anthropic = translate_response(resp, "fallback").unwrap();
+        assert_eq!(anthropic.usage.input_tokens, 7);
+        assert_eq!(anthropic.usage.cache_read_input_tokens, None);
+        assert_eq!(anthropic.usage.cache_creation_input_tokens, None);
     }
 
     #[test]
@@ -1110,7 +1256,35 @@ mod tests {
         .unwrap();
         assert!(estimate_input_tokens(&small) >= 1);
         assert!(estimate_input_tokens(&large) > estimate_input_tokens(&small));
-        assert!(estimate_input_tokens(&large) >= 1000); // ~4000 chars / 4
+    }
+
+    #[test]
+    fn estimate_matches_real_tokenizer_for_code() {
+        // The whole point: a real BPE tokenizer counts code accurately, where the old
+        // chars/4 heuristic under-counted (which is what made Claude Code compact too late).
+        let code = "fn main() { let xs: Vec<i32> = (0..100).filter(|n| n % 2 == 0).collect(); \
+                    println!(\"{:?}\", xs); }";
+        let req: anthropic::CountTokensRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": code}]
+        }))
+        .unwrap();
+        let est = estimate_input_tokens(&req) as usize;
+        // cl100k tokenizes this to ~45 tokens; the old chars/4 would have said ~26.
+        assert!(
+            est > code.len() / 4,
+            "estimate {est} should exceed the old chars/4"
+        );
+        assert!(est >= 30);
+    }
+
+    #[test]
+    fn estimate_counts_cjk() {
+        let cjk: anthropic::CountTokensRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "你好世界你好世界你好世界"}]
+        }))
+        .unwrap();
+        // CJK tokenizes to multiple tokens per character — must be a meaningful count.
+        assert!(estimate_input_tokens(&cjk) >= 12);
     }
 
     #[test]

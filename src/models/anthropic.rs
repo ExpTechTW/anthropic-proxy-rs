@@ -33,6 +33,8 @@ pub struct AnthropicRequest {
 /// but without `max_tokens` (which the count-tokens endpoint does not require).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CountTokensRequest {
+    #[serde(default)]
+    pub model: String,
     pub messages: Vec<Message>,
     #[serde(default)]
     pub system: Option<SystemPrompt>,
@@ -164,10 +166,14 @@ pub enum ResponseContent {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,11 +260,13 @@ pub struct MessageDeltaData {
     pub stop_sequence: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeltaUsage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u32>,
     pub output_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 impl StreamEvent {

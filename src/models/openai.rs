@@ -44,7 +44,31 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Request to a vLLM-style `/tokenize` endpoint (plain text).
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenizeRequest {
+    pub model: String,
+    pub prompt: String,
+}
+
+/// Chat-aware `/tokenize` request: the gateway applies the model's chat template, so
+/// the returned `count` already includes per-message template overhead (no estimate).
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenizeMessagesRequest {
+    pub model: String,
+    pub messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
+}
+
+/// Response from `/tokenize` — `count` is the exact prompt token count (other fields
+/// such as `max_model_len`/`tokens` are ignored).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenizeResponse {
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: Option<MessageContent>,
@@ -159,6 +183,16 @@ pub struct Usage {
     pub completion_tokens: u32,
     #[serde(default)]
     pub total_tokens: u32,
+    // OpenAI reports cached (prompt-cache) tokens here; surfaced to clients as
+    // Anthropic `cache_read_input_tokens` so cost/cache stats stay accurate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

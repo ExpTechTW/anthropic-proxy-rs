@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::error::{ProxyError, ProxyResult};
 use crate::metrics;
 use crate::models::{anthropic, openai};
-use crate::translate::{pipeline, stream};
+use crate::translate::{core, pipeline, stream};
 use axum::{
     body::Body,
     http::{HeaderMap, HeaderValue, StatusCode},
@@ -23,11 +23,11 @@ pub async fn proxy_handler(
 ) -> ProxyResult<Response> {
     let is_streaming = req.stream.unwrap_or(false);
     let start = Instant::now();
+    let client_model = req.model.clone();
 
     let api_key = resolve_api_key(&config, &headers);
 
-    tracing::debug!("Received request for model: {}", req.model);
-    tracing::debug!("Streaming: {}", is_streaming);
+    tracing::debug!(model = %client_model, streaming = is_streaming, "received request");
     metrics::request_started(is_streaming);
 
     if config.verbose {
@@ -39,6 +39,7 @@ pub async fn proxy_handler(
 
     let policy = translation_policy(&config);
     let openai_req = pipeline::translate_request(req, &policy)?;
+    let upstream_model = openai_req.model.clone();
 
     if config.verbose {
         tracing::trace!(
@@ -59,16 +60,284 @@ pub async fn proxy_handler(
     };
     metrics::request_finished(start, status, is_streaming);
 
+    // One line per request; failures log at WARN (visible at the default level)
+    // with the upstream's error message so production issues are diagnosable.
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    match &result {
+        Ok(_) => tracing::debug!(
+            model = %client_model, upstream = %upstream_model,
+            status, elapsed_ms, streaming = is_streaming, "request completed"
+        ),
+        Err(err) => tracing::warn!(
+            model = %client_model, upstream = %upstream_model,
+            status, elapsed_ms, streaming = is_streaming, "request failed: {err}"
+        ),
+    }
+
     result
 }
 
 /// `POST /v1/messages/count_tokens` — Claude Code calls this for context budgeting.
-/// The upstream exposes no count endpoint, so we return a local heuristic estimate.
+/// Prefers the upstream `/tokenize` endpoint for an exact count (when enabled), and
+/// falls back to a local BPE estimate when it's disabled, the model can't be tokenized,
+/// or the upstream call fails.
 pub async fn count_tokens_handler(
+    Extension(config): Extension<Arc<Config>>,
+    Extension(client): Extension<Client>,
+    headers: HeaderMap,
     Json(req): Json<anthropic::CountTokensRequest>,
 ) -> ProxyResult<Response> {
-    let input_tokens = pipeline::estimate_input_tokens(&req);
+    if config.verbose {
+        tracing::trace!(
+            "count_tokens request: {}",
+            serde_json::to_string_pretty(&req).unwrap_or_default()
+        );
+    }
+
+    let (input_tokens, source) = match upstream_count_tokens(&config, &client, &headers, &req).await
+    {
+        Some(count) => (count, "upstream"),
+        None => (pipeline::estimate_input_tokens(&req), "estimate"),
+    };
+
+    tracing::debug!(
+        model = %req.model,
+        messages = req.messages.len(),
+        tools = req.tools.as_ref().map_or(0, Vec::len),
+        input_tokens,
+        source,
+        "count_tokens"
+    );
+
     Ok(Json(serde_json::json!({ "input_tokens": input_tokens })).into_response())
+}
+
+/// Get an exact token count from the upstream `/tokenize`. Prefers the chat-aware form
+/// (the gateway applies the model's chat template, so `count` already includes per-message
+/// overhead — no estimate); falls back to plain-prompt tokenization plus our own overhead
+/// for gateways without `messages` support. Returns `None` (→ local estimate) when
+/// disabled, no model is given, or every attempt fails (failures are logged at WARN).
+async fn upstream_count_tokens(
+    config: &Config,
+    client: &Client,
+    headers: &HeaderMap,
+    req: &anthropic::CountTokensRequest,
+) -> Option<u32> {
+    if !config.upstream_tokenize {
+        return None;
+    }
+
+    // Translate the count request exactly like a real chat request, so the tokenized
+    // messages match what the model is actually fed (system handling, tool_use/result,
+    // images, tool schemas). select_model maps "auto"/model_map the same way chat does.
+    let anth = anthropic::AnthropicRequest {
+        model: req.model.clone(),
+        messages: req.messages.clone(),
+        max_tokens: 1,
+        system: req.system.clone(),
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        stop_sequences: None,
+        stream: None,
+        tools: req.tools.clone(),
+        metadata: None,
+        tool_choice: None,
+        extra: serde_json::Value::Null,
+    };
+    let openai = pipeline::translate_request(anth, &translation_policy(config)).ok()?;
+    if openai.model.is_empty() {
+        return None;
+    }
+
+    let url = config.tokenize_urls().into_iter().next()?;
+    let api_key = resolve_api_key(config, headers);
+
+    // 1. Chat-aware tokenize: exact, template-applied count with no overhead guess.
+    if let Some(count) = tokenize_chat(client, &url, &openai, api_key.as_deref()).await {
+        return Some(count);
+    }
+
+    // 2. Fallback (gateway without messages support): plain prompt + our per-message overhead.
+    tokenize_prompt(client, &url, &openai.model, req, api_key.as_deref()).await
+}
+
+/// Chat-aware `/tokenize`. Returns `None` so the caller falls back to the prompt form
+/// when the gateway rejects `messages` (older build) or the response is unusable. Stays
+/// quiet on failure — the prompt fallback logs if it fails too.
+async fn tokenize_chat(
+    client: &Client,
+    url: &str,
+    openai: &openai::OpenAIRequest,
+    api_key: Option<&str>,
+) -> Option<u32> {
+    let mut req_builder = client
+        .post(url)
+        .json(&openai::TokenizeMessagesRequest {
+            model: openai.model.clone(),
+            messages: openai.messages.clone(),
+            tools: openai.tools.clone(),
+        })
+        .timeout(Duration::from_secs(30));
+    if let Some(key) = api_key {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+    }
+    let response = req_builder.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let tokenized: openai::TokenizeResponse = response.json().await.ok()?;
+    Some(tokenized.count)
+}
+
+/// Plain-prompt `/tokenize` plus our per-message chat-template overhead. A concrete model
+/// reached this point, so unexpected failures are logged at WARN before falling back.
+async fn tokenize_prompt(
+    client: &Client,
+    url: &str,
+    model: &str,
+    req: &anthropic::CountTokensRequest,
+    api_key: Option<&str>,
+) -> Option<u32> {
+    let (prompt, message_count) = pipeline::collect_tokenize_text(req);
+
+    let mut req_builder = client
+        .post(url)
+        .json(&openai::TokenizeRequest {
+            model: model.to_string(),
+            prompt,
+        })
+        .timeout(Duration::from_secs(30));
+    if let Some(key) = api_key {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+    }
+
+    let response = match req_builder.send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::warn!("upstream /tokenize unreachable ({url}): {err}; using local estimate");
+            return None;
+        }
+    };
+    if !response.status().is_success() {
+        tracing::warn!(
+            "upstream /tokenize returned {}; using local estimate",
+            response.status()
+        );
+        return None;
+    }
+    let tokenized: openai::TokenizeResponse = match response.json().await {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!("upstream /tokenize body unparseable: {err}; using local estimate");
+            return None;
+        }
+    };
+
+    // Exact content tokens + the chat template's per-message overhead.
+    Some(tokenized.count + message_count as u32 * pipeline::PER_MESSAGE_OVERHEAD_TOKENS)
+}
+
+/// Compute a `max_tokens` that actually fits the context window after an overflow 400.
+///
+/// We clamp against the *larger* of two input estimates:
+///   1. tokenizing the actual outgoing request (true size when the gateway can apply the
+///      model's chat template — includes tool-injection scaffolding), and
+///   2. the error's "at least N" figure, which equals `context + 1 - max_tokens` and is a
+///      *hard lower bound* that tightens toward the real input as `max_tokens` shrinks.
+///
+/// Taking the max matters: a prompt-only tokenizer (gateway without `messages` support)
+/// under-counts the tool template and would clamp *above* the real input, so the retry 400s
+/// again and the re-clamp computes the same value — it never converges (field: 32000 → 15746
+/// → fail, real input 89375 vs tokenized ~87272). The error's lower bound guarantees each
+/// retry moves down. Returns `None` when the prompt alone fills the window (only compaction
+/// can fix that).
+async fn clamp_for_overflow(
+    client: &Client,
+    config: &Config,
+    openai: &openai::OpenAIRequest,
+    api_key: Option<&str>,
+    message: &str,
+) -> Option<u32> {
+    let (context, error_input) = core::parse_context_overflow(message)?;
+
+    let tokenized = match config.tokenize_urls().into_iter().next() {
+        Some(url) => tokenize_openai_input(client, &url, openai, api_key).await,
+        None => None,
+    };
+    let input = tokenized.unwrap_or(0).max(error_input);
+
+    core::fit_output_to_window(context, input, openai.max_tokens)
+}
+
+/// Tokenize an outgoing chat request to get its true input size. Prefers the chat-aware
+/// `/tokenize` (template applied); falls back to tokenizing the concatenated message/tool
+/// text plus per-message overhead so it still works on gateways without `messages` support.
+async fn tokenize_openai_input(
+    client: &Client,
+    url: &str,
+    openai: &openai::OpenAIRequest,
+    api_key: Option<&str>,
+) -> Option<u32> {
+    if let Some(count) = tokenize_chat(client, url, openai, api_key).await {
+        return Some(count);
+    }
+    let (prompt, message_count) = openai_tokenize_text(openai);
+    let mut req_builder = client
+        .post(url)
+        .json(&openai::TokenizeRequest {
+            model: openai.model.clone(),
+            prompt,
+        })
+        .timeout(Duration::from_secs(30));
+    if let Some(key) = api_key {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+    }
+    let response = req_builder.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let tokenized: openai::TokenizeResponse = response.json().await.ok()?;
+    Some(tokenized.count + message_count as u32 * pipeline::PER_MESSAGE_OVERHEAD_TOKENS)
+}
+
+/// Flatten an OpenAI request to the text that contributes to the prompt (message content,
+/// reasoning, tool-call arguments, and tool schemas) plus the message count. Base64 image
+/// parts are skipped — they are not text and would massively over-count.
+fn openai_tokenize_text(openai: &openai::OpenAIRequest) -> (String, usize) {
+    let mut parts: Vec<String> = Vec::new();
+    for m in &openai.messages {
+        match &m.content {
+            Some(openai::MessageContent::Text(t)) => parts.push(t.clone()),
+            Some(openai::MessageContent::Parts(ps)) => {
+                for p in ps {
+                    if let openai::ContentPart::Text { text } = p {
+                        parts.push(text.clone());
+                    }
+                }
+            }
+            None => {}
+        }
+        if let Some(rc) = &m.reasoning_content {
+            parts.push(rc.clone());
+        }
+        if let Some(tcs) = &m.tool_calls {
+            for tc in tcs {
+                parts.push(tc.function.name.clone());
+                parts.push(tc.function.arguments.clone());
+            }
+        }
+    }
+    if let Some(tools) = &openai.tools {
+        for t in tools {
+            parts.push(t.function.name.clone());
+            if let Some(d) = &t.function.description {
+                parts.push(d.clone());
+            }
+            parts.push(t.function.parameters.to_string());
+        }
+    }
+    (parts.join("\n"), openai.messages.len())
 }
 
 pub async fn list_models_handler(
@@ -146,6 +415,10 @@ fn translation_policy(config: &Config) -> pipeline::TranslationPolicy {
 
 /// Max attempts per upstream URL (initial try + retries) for transient failures.
 const MAX_ATTEMPTS: usize = 3;
+
+/// Max context-overflow clamps per request. Each clamp tightens against the error's rising
+/// lower bound, so a few passes converge even when the local tokenizer under-counts.
+const MAX_CLAMP_RETRIES: u32 = 3;
 
 fn is_retriable_status(status: u16) -> bool {
     matches!(status, 429 | 500..=599)
@@ -234,11 +507,12 @@ async fn send_request(
 async fn handle_non_streaming(
     config: Arc<Config>,
     client: Client,
-    openai_req: openai::OpenAIRequest,
+    mut openai_req: openai::OpenAIRequest,
     api_key: Option<String>,
 ) -> ProxyResult<Response> {
     let urls = config.chat_completions_urls();
     let mut last_err = None;
+    let mut clamp_attempts = 0u32;
 
     for url in &urls {
         for attempt in 1..=MAX_ATTEMPTS {
@@ -277,22 +551,43 @@ async fn handle_non_streaming(
                     retriable,
                 } => {
                     metrics::upstream_error("chat_completions");
-                    let err = ProxyError::UpstreamStatus { status, message };
+                    // Self-heal a context-length overflow once: clamp max_tokens so
+                    // input + output fits the window, then retry. This unblocks the
+                    // deadlock where even /compact can't run because it requests output.
+                    if status.as_u16() == 400 && clamp_attempts < MAX_CLAMP_RETRIES {
+                        if let Some(new_max) = clamp_for_overflow(
+                            &client,
+                            &config,
+                            &openai_req,
+                            api_key.as_deref(),
+                            &message,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "upstream {url} context overflow; clamping max_tokens {:?} -> {new_max} and retrying",
+                                openai_req.max_tokens
+                            );
+                            openai_req.max_tokens = Some(new_max);
+                            clamp_attempts += 1;
+                            continue;
+                        }
+                    }
                     if retriable {
                         tracing::warn!(
-                            "Upstream {} attempt {}/{} returned {}",
-                            url,
-                            attempt,
-                            MAX_ATTEMPTS,
-                            status
+                            "upstream {url} attempt {attempt}/{MAX_ATTEMPTS} returned {status}: {message}"
                         );
-                        last_err = Some(err);
+                        last_err = Some(ProxyError::UpstreamStatus { status, message });
                         continue;
                     }
                     // 4xx is deterministic — surface the real status instead of masking as 502.
+                    tracing::warn!("upstream {url} returned {status} (non-retriable): {message}");
+                    return Err(ProxyError::UpstreamStatus { status, message });
+                }
+                SendOutcome::Fatal(err) => {
+                    tracing::warn!("upstream {url} fatal transport error: {err}");
                     return Err(err);
                 }
-                SendOutcome::Fatal(err) => return Err(err),
             };
 
             // Read the body explicitly so a mid-body transport drop is retried
@@ -363,11 +658,12 @@ async fn handle_non_streaming(
 async fn handle_streaming(
     config: Arc<Config>,
     client: Client,
-    openai_req: openai::OpenAIRequest,
+    mut openai_req: openai::OpenAIRequest,
     api_key: Option<String>,
 ) -> ProxyResult<Response> {
     let urls = config.chat_completions_urls();
     let mut last_err = None;
+    let mut clamp_attempts = 0u32;
 
     // Only the connection handshake is retried; once bytes start streaming we are
     // committed (events may already have reached the client).
@@ -408,26 +704,48 @@ async fn handle_streaming(
                     retriable,
                 } => {
                     metrics::upstream_error("chat_completions");
-                    let err = ProxyError::UpstreamStatus { status, message };
+                    // Self-heal a context-length overflow once: clamp max_tokens so
+                    // input + output fits the window, then retry. This unblocks the
+                    // deadlock where even /compact can't run because it requests output.
+                    if status.as_u16() == 400 && clamp_attempts < MAX_CLAMP_RETRIES {
+                        if let Some(new_max) = clamp_for_overflow(
+                            &client,
+                            &config,
+                            &openai_req,
+                            api_key.as_deref(),
+                            &message,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "upstream {url} context overflow; clamping max_tokens {:?} -> {new_max} and retrying",
+                                openai_req.max_tokens
+                            );
+                            openai_req.max_tokens = Some(new_max);
+                            clamp_attempts += 1;
+                            continue;
+                        }
+                    }
                     if retriable {
                         tracing::warn!(
-                            "Upstream {} attempt {}/{} returned {}",
-                            url,
-                            attempt,
-                            MAX_ATTEMPTS,
-                            status
+                            "upstream {url} attempt {attempt}/{MAX_ATTEMPTS} returned {status}: {message}"
                         );
-                        last_err = Some(err);
+                        last_err = Some(ProxyError::UpstreamStatus { status, message });
                         continue;
                     }
                     // 4xx is deterministic — surface the real status instead of masking as 502.
+                    tracing::warn!("upstream {url} returned {status} (non-retriable): {message}");
+                    return Err(ProxyError::UpstreamStatus { status, message });
+                }
+                SendOutcome::Fatal(err) => {
+                    tracing::warn!("upstream {url} fatal transport error: {err}");
                     return Err(err);
                 }
-                SendOutcome::Fatal(err) => return Err(err),
             };
 
             let upstream = response.bytes_stream();
-            let sse_stream = create_sse_stream(upstream, openai_req.model.clone());
+            let input_estimate = pipeline::estimate_openai_input_tokens(&openai_req);
+            let sse_stream = create_sse_stream(upstream, openai_req.model.clone(), input_estimate);
 
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -469,10 +787,11 @@ fn create_sse_stream(
         + Send
         + 'static,
     fallback_model: String,
+    input_estimate: u32,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
-        let mut state = stream::initial_state(fallback_model);
+        let mut state = stream::initial_state(fallback_model, input_estimate);
 
         tokio::pin!(upstream);
 
@@ -518,6 +837,12 @@ fn create_sse_stream(
                     break;
                 }
             }
+        }
+
+        // Safety net: if the upstream closed without a `[DONE]` marker, still emit the
+        // closing message_delta (with usage) + message_stop. No-op if already finalized.
+        for event in stream::translate_done(&mut state) {
+            yield Ok(Bytes::from(serialize_event(&event)));
         }
     }
 }
@@ -625,7 +950,7 @@ mod tests {
 
     async fn collect_events(chunks: Vec<String>, model: &str) -> Vec<Value> {
         let s = make_stream(chunks);
-        let sse = create_sse_stream(s, model.to_string());
+        let sse = create_sse_stream(s, model.to_string(), 0);
         tokio::pin!(sse);
 
         let mut events = Vec::new();
@@ -904,7 +1229,7 @@ mod tests {
             Err(TestError),
         ];
         let s = stream::iter(items);
-        let sse = create_sse_stream(s, "fallback".to_string());
+        let sse = create_sse_stream(s, "fallback".to_string(), 0);
         tokio::pin!(sse);
 
         let mut events = Vec::new();

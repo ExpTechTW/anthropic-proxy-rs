@@ -10,10 +10,7 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
             result.push(openai::Message {
                 role: msg.role,
                 content: Some(openai::MessageContent::Text(text)),
-                reasoning_content: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
+                ..Default::default()
             });
         }
         anthropic::MessageContent::Blocks(blocks) => {
@@ -62,10 +59,8 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
                         result.push(openai::Message {
                             role: "tool".to_string(),
                             content: Some(openai::MessageContent::Text(text)),
-                            reasoning_content: None,
-                            tool_calls: None,
                             tool_call_id: Some(tool_use_id),
-                            name: None,
+                            ..Default::default()
                         });
                     }
                     anthropic::ContentBlock::Thinking { thinking } => {
@@ -94,18 +89,10 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
                 result.push(openai::Message {
                     role: msg.role,
                     content,
-                    reasoning_content: if reasoning_parts.is_empty() {
-                        None
-                    } else {
-                        Some(reasoning_parts.join(""))
-                    },
-                    tool_calls: if tool_calls.is_empty() {
-                        None
-                    } else {
-                        Some(tool_calls)
-                    },
-                    tool_call_id: None,
-                    name: None,
+                    reasoning_content: (!reasoning_parts.is_empty())
+                        .then(|| reasoning_parts.join("")),
+                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                    ..Default::default()
                 });
             }
         }
@@ -241,6 +228,68 @@ pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
         }
         .to_string()
     })
+}
+
+/// Given the window size, the (true) input token count, and the current `max_tokens`,
+/// return a reduced `max_tokens` that leaves the prompt room to fit — or `None` when the
+/// prompt alone already fills the window (nothing an output clamp can fix) or no reduction
+/// is needed.
+///
+/// This breaks the deadlock where a conversation is just over the limit: the upstream
+/// rejects `input + max_tokens > context`, but `input` alone still fits, so trimming the
+/// *output* budget lets the request through (including Claude Code's `/compact`, which
+/// otherwise can't run because it too requests output). Headroom is ~2% of the window
+/// (min 1024) to absorb any residual tokenizer drift between our count and the upstream's.
+pub fn fit_output_to_window(context: u32, input: u32, current_max: Option<u32>) -> Option<u32> {
+    const MIN_OUTPUT: u32 = 256;
+
+    let margin = (context / 50).max(1024);
+    let available = context.checked_sub(input)?.checked_sub(margin)?;
+    let current = current_max.unwrap_or(u32::MAX);
+
+    (available >= MIN_OUTPUT && available < current).then_some(available)
+}
+
+/// Parse `(max_context_tokens, input_tokens)` from an OpenAI-style overflow message.
+/// The `input_tokens` here is the upstream's *loose lower bound* (`context+1 - max_tokens`),
+/// not the true prompt size — callers that can tokenize the request should prefer that.
+pub fn parse_context_overflow(message: &str) -> Option<(u32, u32)> {
+    let context = leading_number(message.split_once("context length is ")?.1)?;
+    let input = message
+        .split_once("contains at least ")
+        .and_then(|(_, rest)| leading_number(rest))
+        .or_else(|| trailing_number(message.split_once(" input tokens")?.0))?;
+    Some((context, input))
+}
+
+fn leading_number(s: &str) -> Option<u32> {
+    s.chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+fn trailing_number(s: &str) -> Option<u32> {
+    let reversed: String = s.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+    reversed.chars().rev().collect::<String>().parse().ok()
+}
+
+/// Split OpenAI prompt tokens into Anthropic `(input_tokens, cache_read_input_tokens)`.
+///
+/// OpenAI's `prompt_tokens` is the *total* input including any cache hits, with the
+/// cached subset reported under `prompt_tokens_details.cached_tokens`. Anthropic
+/// instead reports the non-cached input separately from `cache_read_input_tokens`,
+/// so we subtract to avoid double-counting cached tokens in client cost math. The
+/// cache figure is `None` when the upstream did not report cached tokens.
+pub fn split_prompt_tokens(usage: &openai::Usage) -> (u32, Option<u32>) {
+    match usage.prompt_tokens_details.as_ref() {
+        Some(details) => (
+            usage.prompt_tokens.saturating_sub(details.cached_tokens),
+            Some(details.cached_tokens),
+        ),
+        None => (usage.prompt_tokens, None),
+    }
 }
 
 /// Translate an Anthropic `tool_choice` into the OpenAI equivalent.
@@ -490,6 +539,75 @@ mod tests {
         assert_eq!(
             translate_tool_choice(&json!({"type": "tool"})),
             (None, None)
+        );
+    }
+
+    #[test]
+    fn clamp_reduces_max_tokens_to_fit_context() {
+        // The real deadlock: input + 16384 output > 105120. We clamp against the TRUE input
+        // (from the tokenizer), here 95011, not the error's loose lower bound.
+        // margin = max(105120/50, 1024) = 2102; available = 105120 - 95011 - 2102 = 8007
+        let clamped = fit_output_to_window(105120, 95011, Some(16384)).unwrap();
+        assert_eq!(clamped, 8007);
+        assert!(95011 + clamped <= 105120);
+    }
+
+    #[test]
+    fn clamp_parses_context_and_input_from_error() {
+        let msg = "This model's maximum context length is 105120 tokens. However, you \
+                   requested 16384 output tokens and your prompt contains at least 88737 \
+                   input tokens, for a total of at least 105121 tokens.";
+        assert_eq!(parse_context_overflow(msg), Some((105120, 88737)));
+    }
+
+    #[test]
+    fn clamp_none_when_prompt_alone_exceeds_window() {
+        assert_eq!(fit_output_to_window(1000, 1200, Some(500)), None);
+    }
+
+    #[test]
+    fn clamp_converges_via_error_lower_bound() {
+        // Field regression: the tokenizer under-counted (87272) so clamping on it yields
+        // 15746, which does NOT fit the real 89375-token prompt. The caller instead clamps
+        // on max(tokenized, error_lower_bound) = 89375, which fits and is strictly smaller
+        // than the failed 15746 — so the retry makes progress instead of stalling.
+        let under_count = fit_output_to_window(105120, 87272, Some(32000)).unwrap();
+        assert_eq!(under_count, 15746);
+        assert!(
+            89375 + under_count > 105120,
+            "under-count clamp still overflows"
+        );
+
+        let on_lower_bound = fit_output_to_window(105120, 89375, Some(15746)).unwrap();
+        assert!(on_lower_bound < 15746, "retry must shrink max_tokens");
+        assert!(
+            89375 + on_lower_bound <= 105120,
+            "lower-bound clamp must fit"
+        );
+    }
+
+    #[test]
+    fn clamp_none_for_unrelated_errors() {
+        assert_eq!(parse_context_overflow("invalid api key"), None);
+    }
+
+    #[test]
+    fn clamp_none_when_available_not_smaller_than_current() {
+        // Plenty of room — no need to clamp a small request.
+        // available = 105120 - 1000 - 2102 = 102018, which is not < current (8000).
+        assert_eq!(fit_output_to_window(105120, 1000, Some(8000)), None);
+    }
+
+    #[test]
+    fn clamp_parses_input_via_trailing_fallback() {
+        // No "contains at least" phrasing — fall back to "<n> input tokens".
+        let msg = "maximum context length is 200000 tokens, but you have 100000 input tokens";
+        let (context, input) = parse_context_overflow(msg).unwrap();
+        assert_eq!((context, input), (200000, 100000));
+        // margin = max(200000/50, 1024) = 4000; available = 200000 - 100000 - 4000 = 96000
+        assert_eq!(
+            fit_output_to_window(context, input, Some(150000)),
+            Some(96000)
         );
     }
 

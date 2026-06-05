@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(
     name = "anthropic-proxy",
-    version,
+    version = crate::VERSION,
     about = "Proxy Anthropic API requests to OpenAI-compatible endpoints",
     long_about = "A high-performance proxy that translates Anthropic Claude API requests \
                   to OpenAI-compatible endpoints like OpenRouter, allowing you to use \
