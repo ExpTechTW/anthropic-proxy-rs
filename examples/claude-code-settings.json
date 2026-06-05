@@ -2,8 +2,26 @@
   "env": {
     "ANTHROPIC_BASE_URL": "https://your-proxy.example.com",
     "ANTHROPIC_AUTH_TOKEN": "<your-upstream-api-key>",
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "105120",
-    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-3-5",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "105120"
   },
-  "model": "claude-sonnet-4-5"
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
+  "model": "claude-sonnet-4-5",
+  "availableModels": [
+    "claude-opus-4-7",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-20250514",
+    "claude-haiku-3-5"
+  ],
+  "enabledPlugins": {
+    "mcp-server-dev@claude-plugins-official": true
+  },
+  "skipDangerousModePermissionPrompt": true,
+  "theme": "dark",
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/statusline.sh"
+  }
 }

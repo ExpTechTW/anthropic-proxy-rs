@@ -119,44 +119,34 @@ docker build -f Dockerfile.source -t anthropic-proxy .
 ## 搭配 Claude Code
 
 ```bash
-# 以 daemon 啟動代理,並讓 Claude Code 連到它
 anthropic-proxy --daemon && ANTHROPIC_BASE_URL=http://localhost:3000 claude
-
-# 或用兩個終端機:
-anthropic-proxy                                   # 終端機 1
-ANTHROPIC_BASE_URL=http://localhost:3000 claude   # 終端機 2
 ```
 
-### 建議的 `settings.json`
+### 建議設定 — [`examples/claude-code-settings.json`](examples/claude-code-settings.json)
 
-當上游模型的 context 視窗**比 Claude 模型名稱所暗示的小**(例如把 105K token 的後端對映到 `claude-sonnet-4-5`,而 Claude Code 以為它是 200K/1M),Claude Code 會**遠遠超過**真實上限才自動壓縮 —— 接著每個請求都會 `context length exceeded` 失敗。要告訴它真實視窗:
+複製到 `~/.claude/settings.json`(或專案層級的 `.claude/settings.json`),填入你的代理 URL 與金鑰。真正關鍵的只有一個:
 
-把 [`examples/claude-code-settings.json`](examples/claude-code-settings.json) 複製到你的 Claude Code 設定(`~/.claude/settings.json`,或專案層級的 `.claude/settings.json`):
+**`CLAUDE_CODE_AUTO_COMPACT_WINDOW`** —— 設成上游模型的**真實** context 視窗(token 數,例如 `105120`)。當較小的後端被對映到 `claude-sonnet-4-5` 這種名稱時,Claude Code 會以為它是模型完整的 200K/1M 視窗,於是**遠遠超過**真實上限才自動壓縮 —— 最後每個請求都 `context length exceeded` 失敗。
 
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "https://your-proxy.example.com",
-    "ANTHROPIC_AUTH_TOKEN": "<your-upstream-api-key>",
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "105120",
-    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"
-  },
-  "model": "claude-sonnet-4-5"
-}
-```
-
-| 設定 | 為什麼重要 |
-|------|-----------|
-| `ANTHROPIC_BASE_URL` | 你的代理 URL。 |
-| `ANTHROPIC_AUTH_TOKEN` | 以 `x-api-key` 送出;代理在 passthrough 模式下會用它當上游金鑰。 |
-| **`CLAUDE_CODE_AUTO_COMPACT_WINDOW`** | **設成上游模型的真實 context 視窗**(token 數)。自動壓縮就是用這個值計算的 —— 沒設的話 Claude Code 會用模型名稱的預設值,壓縮得太晚。 |
-| **`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`** | 在視窗的幾 % 觸發壓縮(預設約 95%)。`75` 會留下舒適的回應空間。 |
-
-> ⚠️ **別用 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 來做這件事** —— 依[官方文件](https://code.claude.com/docs/en/env-vars),它只有在同時設定 `DISABLE_COMPACT` 時才生效。真正驅動自動壓縮的是 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`。
+> ⚠️ **別用 `CLAUDE_CODE_MAX_CONTEXT_TOKENS`** —— 依[官方文件](https://code.claude.com/docs/en/env-vars)它只有搭配 `DISABLE_COMPACT` 才生效。驅動自動壓縮的是 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`。
 >
-> 若 `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` 在 `settings.json` 裡看起來沒生效,改設成 shell 環境變數([已知問題](https://github.com/anthropics/claude-code/issues/63186))。
+> **不需要 `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`** —— Claude Code 保留固定 ~33K token 緩衝,所以較小的視窗本來就會留餘裕就壓縮(105K 約在 ~68%)。那個 override 只能讓壓縮**更早**(設高於預設會被忽略),無法延後。
 
-用 `/context` 驗證 —— 它應該顯示你的真實視窗(例如 `30.6k / 105.1k`)以及一行 `Auto-compact window`。
+用 `/context` 驗證:應顯示真實視窗(例如 `30.6k / 105.1k`)與一行 `Auto-compact window`。
+
+### 狀態列 — [`examples/statusline.sh`](examples/statusline.sh)
+
+搭配用的狀態列,顯示**真實**的 context 比例(對齊 `/context`,而非 Claude Code 除以完整視窗的 `used_percentage`)與**累計花費**:
+
+```text
+Sonnet 4.5 │ ctx ━━━━━┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄ 29% 105k │ NT$6.38
+```
+
+費用直接從 session 的 transcript 加總,所以**跟著 session**:session 一刪就消失,不留孤兒狀態檔。安裝(需要 `jq`),再到腳本頂端設定你 gateway 的費率:
+
+```bash
+cp examples/statusline.sh ~/.claude/statusline.sh && chmod +x ~/.claude/statusline.sh
+```
 
 ## 設定
 
