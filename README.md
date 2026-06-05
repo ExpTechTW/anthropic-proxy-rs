@@ -257,8 +257,15 @@ UPSTREAM_BASE_URL=https://gateway.company.internal/v2 \
 ✅ `tool_choice` (`auto`/`any`/`tool`/`none`, incl. `disable_parallel_tool_use`)  
 ✅ `metadata.user_id` (forwarded as OpenAI `user`)  
 ✅ `refusal` stop reason (mapped from upstream `content_filter`)  
+✅ `POST /v1/messages/count_tokens` (local heuristic estimate — upstreams expose no count endpoint)  
 
 > **Note**: Make sure your upstream model supports tool use. Especially if you are using this proxy for coding agents like Claude Code.
+
+### Reliability
+
+- **Upstream status codes are preserved.** A client error (e.g. `400` invalid request, `403`/`404`, `429` rate limit) is surfaced with its original status and an Anthropic-shaped error body (`{"type":"error","error":{"type":...,"message":...}}`), not masked as a generic `502`. Only genuine transport failures map to `502`.
+- **Transient failures are retried.** Connection/timeout/body errors retry up to 3× per upstream with a fresh connection; idle pooled connections are kept short-lived to avoid stale-socket `502`s under load.
+- **Request timeout is 600s**, matching a typical fronting nginx `proxy_read_timeout`, so long generations/streams are not cut short.
 
 ### Extended Thinking Mode
 

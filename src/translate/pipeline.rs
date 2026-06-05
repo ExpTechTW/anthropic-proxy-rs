@@ -167,6 +167,71 @@ pub fn translate_response(
     })
 }
 
+/// Estimate the input token count for a count-tokens request.
+///
+/// This is a heuristic (~4 UTF-8 bytes per token plus per-message overhead), not a
+/// real tokenizer — the OpenAI-compatible upstream exposes no count endpoint, so a
+/// stable ballpark is preferable to returning a 404 that breaks client context
+/// budgeting. Base64 image payloads are excluded so they don't inflate the count.
+pub fn estimate_input_tokens(req: &anthropic::CountTokensRequest) -> u32 {
+    let mut chars = 0usize;
+
+    if let Some(system) = &req.system {
+        match system {
+            anthropic::SystemPrompt::Single(text) => chars += text.len(),
+            anthropic::SystemPrompt::Multiple(messages) => {
+                for msg in messages {
+                    chars += msg.text.len();
+                }
+            }
+        }
+    }
+
+    for msg in &req.messages {
+        chars += msg.role.len();
+        chars += estimate_content_chars(&msg.content);
+    }
+
+    if let Some(tools) = &req.tools {
+        for tool in tools {
+            chars += tool.name.len();
+            if let Some(description) = &tool.description {
+                chars += description.len();
+            }
+            chars += tool.input_schema.to_string().len();
+        }
+    }
+
+    let overhead = req.messages.len().saturating_mul(4);
+    ((chars / 4) + overhead).max(1) as u32
+}
+
+fn estimate_content_chars(content: &anthropic::MessageContent) -> usize {
+    match content {
+        anthropic::MessageContent::Text(text) => text.len(),
+        anthropic::MessageContent::Blocks(blocks) => blocks.iter().map(estimate_block_chars).sum(),
+    }
+}
+
+fn estimate_block_chars(block: &anthropic::ContentBlock) -> usize {
+    match block {
+        anthropic::ContentBlock::Text { text, .. } => text.len(),
+        anthropic::ContentBlock::Thinking { thinking } => thinking.len(),
+        anthropic::ContentBlock::ToolUse { name, input, .. } => {
+            name.len() + input.to_string().len()
+        }
+        anthropic::ContentBlock::ToolResult { content, .. } => match content {
+            anthropic::ToolResultContent::Text(text) => text.len(),
+            anthropic::ToolResultContent::Blocks(blocks) => {
+                blocks.iter().map(estimate_block_chars).sum()
+            }
+        },
+        // Image payloads (base64) are intentionally not counted — they would
+        // wildly inflate the estimate and the upstream text models ignore them.
+        anthropic::ContentBlock::Image { .. } => 0,
+    }
+}
+
 pub fn translate_models_list(resp: openai::ModelsListResponse) -> anthropic::ModelsListResponse {
     let data: Vec<_> = resp
         .data
@@ -1031,6 +1096,39 @@ mod tests {
             &anthropic.content[1],
             anthropic::ResponseContent::Text { text, .. } if text == "answer"
         ));
+    }
+
+    #[test]
+    fn estimate_tokens_scales_with_text_and_is_nonzero() {
+        let small: anthropic::CountTokensRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let large: anthropic::CountTokensRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "x".repeat(4000)}]
+        }))
+        .unwrap();
+        assert!(estimate_input_tokens(&small) >= 1);
+        assert!(estimate_input_tokens(&large) > estimate_input_tokens(&small));
+        assert!(estimate_input_tokens(&large) >= 1000); // ~4000 chars / 4
+    }
+
+    #[test]
+    fn estimate_tokens_counts_system_and_tools_but_not_images() {
+        let with_image: anthropic::CountTokensRequest = serde_json::from_value(json!({
+            "system": "be terse",
+            "tools": [{"name": "t", "description": "d", "input_schema": {"type": "object"}}],
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "A".repeat(100000)}},
+                    {"type": "text", "text": "tiny"}
+                ]
+            }]
+        }))
+        .unwrap();
+        // A 100k-char base64 blob must NOT dominate the estimate.
+        assert!(estimate_input_tokens(&with_image) < 200);
     }
 
     #[test]

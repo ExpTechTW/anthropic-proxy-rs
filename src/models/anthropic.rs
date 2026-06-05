@@ -29,6 +29,17 @@ pub struct AnthropicRequest {
     pub extra: Value,
 }
 
+/// Request body for `POST /v1/messages/count_tokens`. Mirrors a messages request
+/// but without `max_tokens` (which the count-tokens endpoint does not require).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CountTokensRequest {
+    pub messages: Vec<Message>,
+    #[serde(default)]
+    pub system: Option<SystemPrompt>,
+    #[serde(default)]
+    pub tools: Option<Vec<Tool>>,
+}
+
 /// System prompt can be a string or array of strings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]

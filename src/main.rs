@@ -178,6 +178,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/v1/messages", post(proxy::proxy_handler))
+        // Tolerate a trailing slash (some clients append one to ANTHROPIC_BASE_URL).
+        .route("/v1/messages/", post(proxy::proxy_handler))
+        .route(
+            "/v1/messages/count_tokens",
+            post(proxy::count_tokens_handler),
+        )
         .route("/v1/models", get(proxy::list_models_handler))
         .route("/health", axum::routing::get(health_handler))
         .route(

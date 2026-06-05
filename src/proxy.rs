@@ -5,7 +5,7 @@ use crate::models::{anthropic, openai};
 use crate::translate::{pipeline, stream};
 use axum::{
     body::Body,
-    http::{HeaderMap, HeaderValue},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
 };
@@ -55,11 +55,20 @@ pub async fn proxy_handler(
 
     let status = match &result {
         Ok(resp) => resp.status().as_u16(),
-        Err(_) => 500,
+        Err(err) => err.status_code().as_u16(),
     };
     metrics::request_finished(start, status, is_streaming);
 
     result
+}
+
+/// `POST /v1/messages/count_tokens` — Claude Code calls this for context budgeting.
+/// The upstream exposes no count endpoint, so we return a local heuristic estimate.
+pub async fn count_tokens_handler(
+    Json(req): Json<anthropic::CountTokensRequest>,
+) -> ProxyResult<Response> {
+    let input_tokens = pipeline::estimate_input_tokens(&req);
+    Ok(Json(serde_json::json!({ "input_tokens": input_tokens })).into_response())
 }
 
 pub async fn list_models_handler(
@@ -149,18 +158,40 @@ fn is_transient(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout() || err.is_request() || err.is_body() || err.is_decode()
 }
 
+/// Extract a human-readable message from an upstream error body, preferring the
+/// OpenAI `{"error":{"message":...}}` / `{"message":...}` shapes, falling back to
+/// the raw (truncated) text.
+fn upstream_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message"))
+                .or_else(|| v.get("message"))
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.chars().take(500).collect())
+}
+
 /// Outcome of a single upstream send attempt.
 enum SendOutcome {
     /// 2xx response, ready to consume.
     Ok(reqwest::Response),
-    /// Try the next attempt / next URL.
+    /// Transport error worth retrying with a fresh connection.
     Retriable(ProxyError),
-    /// Non-retriable; surface to the client immediately.
+    /// Upstream returned a non-2xx HTTP status (code preserved for the client).
+    Status {
+        status: StatusCode,
+        message: String,
+        retriable: bool,
+    },
+    /// Non-retriable transport error; surface immediately.
     Fatal(ProxyError),
 }
 
-/// Issue one POST to `url` and classify the result. The response body is left
-/// unread so streaming and non-streaming callers can consume it differently.
+/// Issue one POST to `url` and classify the result. On a 2xx the response body is
+/// left unread so streaming and non-streaming callers can consume it differently.
 async fn send_request(
     client: &Client,
     url: &str,
@@ -180,15 +211,14 @@ async fn send_request(
         Ok(resp) if resp.status().is_success() => SendOutcome::Ok(resp),
         Ok(resp) => {
             let status = resp.status();
-            let error_text = resp
+            let body = resp
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            let err = ProxyError::Upstream(format!("Upstream returned {}: {}", status, error_text));
-            if is_retriable_status(status.as_u16()) {
-                SendOutcome::Retriable(err)
-            } else {
-                SendOutcome::Fatal(err)
+            SendOutcome::Status {
+                status,
+                message: upstream_message(&body),
+                retriable: is_retriable_status(status.as_u16()),
             }
         }
         Err(err) => {
@@ -240,6 +270,27 @@ async fn handle_non_streaming(
                     );
                     last_err = Some(err);
                     continue;
+                }
+                SendOutcome::Status {
+                    status,
+                    message,
+                    retriable,
+                } => {
+                    metrics::upstream_error("chat_completions");
+                    let err = ProxyError::UpstreamStatus { status, message };
+                    if retriable {
+                        tracing::warn!(
+                            "Upstream {} attempt {}/{} returned {}",
+                            url,
+                            attempt,
+                            MAX_ATTEMPTS,
+                            status
+                        );
+                        last_err = Some(err);
+                        continue;
+                    }
+                    // 4xx is deterministic — surface the real status instead of masking as 502.
+                    return Err(err);
                 }
                 SendOutcome::Fatal(err) => return Err(err),
             };
@@ -350,6 +401,27 @@ async fn handle_streaming(
                     );
                     last_err = Some(err);
                     continue;
+                }
+                SendOutcome::Status {
+                    status,
+                    message,
+                    retriable,
+                } => {
+                    metrics::upstream_error("chat_completions");
+                    let err = ProxyError::UpstreamStatus { status, message };
+                    if retriable {
+                        tracing::warn!(
+                            "Upstream {} attempt {}/{} returned {}",
+                            url,
+                            attempt,
+                            MAX_ATTEMPTS,
+                            status
+                        );
+                        last_err = Some(err);
+                        continue;
+                    }
+                    // 4xx is deterministic — surface the real status instead of masking as 502.
+                    return Err(err);
                 }
                 SendOutcome::Fatal(err) => return Err(err),
             };
@@ -581,6 +653,25 @@ mod tests {
             axum::http::HeaderValue::from_str(value).unwrap(),
         );
         headers
+    }
+
+    #[test]
+    fn upstream_message_extracts_openai_error_shape() {
+        assert_eq!(
+            super::upstream_message(
+                r#"{"error":{"message":"bad model","type":"invalid_request_error"}}"#
+            ),
+            "bad model"
+        );
+        assert_eq!(
+            super::upstream_message(r#"{"message":"flat message"}"#),
+            "flat message"
+        );
+        // Non-JSON or unrecognized shapes fall back to the raw text.
+        assert_eq!(
+            super::upstream_message("plain text error"),
+            "plain text error"
+        );
     }
 
     #[tokio::test]
