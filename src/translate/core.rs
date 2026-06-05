@@ -240,11 +240,15 @@ pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
 /// error isn't a parseable context overflow or the prompt alone already fills the
 /// window (nothing an output clamp can fix).
 pub fn clamp_max_tokens_for_overflow(current_max: Option<u32>, message: &str) -> Option<u32> {
-    const MARGIN: u32 = 64; // headroom for the upstream's "at least" underestimates
     const MIN_OUTPUT: u32 = 256;
 
     let (context, input) = parse_context_overflow(message)?;
-    let available = context.checked_sub(input)?.checked_sub(MARGIN)?;
+    // Generous headroom (~0.5% of the window, min 256). The upstream reports input as
+    // "at least N" — a loose lower bound that varies by tens of tokens between calls, so
+    // a tight margin made the clamped retry overflow again by a single token. Pair this
+    // with the caller re-clamping on a repeat overflow (which uses the fresher count).
+    let margin = (context / 200).max(MIN_OUTPUT);
+    let available = context.checked_sub(input)?.checked_sub(margin)?;
     let current = current_max.unwrap_or(u32::MAX);
 
     (available >= MIN_OUTPUT && available < current).then_some(available)
@@ -546,8 +550,21 @@ mod tests {
         let msg = "This model's maximum context length is 105120 tokens. However, you \
                    requested 16384 output tokens and your prompt contains at least 88737 \
                    input tokens, for a total of at least 105121 tokens.";
-        // context(105120) - input(88737) - margin(64) = 16319
-        assert_eq!(clamp_max_tokens_for_overflow(Some(16384), msg), Some(16319));
+        // margin = max(105120/200, 256) = 525; available = 105120 - 88737 - 525 = 15858
+        let clamped = clamp_max_tokens_for_overflow(Some(16384), msg).unwrap();
+        assert_eq!(clamped, 15858);
+        // The retry must fit even if the real input is somewhat higher than reported.
+        assert!(88737 + clamped <= 105120);
+    }
+
+    #[test]
+    fn clamp_absorbs_underreported_input() {
+        // Reproduces the field failure: first error under-reports input as 88737, but the
+        // real input is 88802. The generous margin must still keep the retry under the cap.
+        let msg =
+            "maximum context length is 105120 tokens ... contains at least 88737 input tokens";
+        let clamped = clamp_max_tokens_for_overflow(Some(16384), msg).unwrap();
+        assert!(88802 + clamped <= 105120, "clamped={clamped}");
     }
 
     #[test]
@@ -575,14 +592,12 @@ mod tests {
     #[test]
     fn clamp_parses_input_via_trailing_fallback() {
         // No "contains at least" phrasing — fall back to "<n> input tokens".
-        let msg = "maximum context length is 8192 tokens, but you have 8000 input tokens";
-        // 8192 - 8000 - 64 = 128 < MIN_OUTPUT(256) → None
-        assert_eq!(clamp_max_tokens_for_overflow(Some(4096), msg), None);
-        let msg2 = "maximum context length is 8192 tokens, but you have 4000 input tokens";
-        // 8192 - 4000 - 64 = 4128 ≥ 256 and < 4096? no, 4128 > 4096 → None
-        assert_eq!(clamp_max_tokens_for_overflow(Some(4096), msg2), None);
-        // request a larger output so the clamp engages
-        assert_eq!(clamp_max_tokens_for_overflow(Some(8000), msg2), Some(4128));
+        // margin = max(200000/200, 256) = 1000; available = 200000 - 100000 - 1000 = 99000
+        let msg = "maximum context length is 200000 tokens, but you have 100000 input tokens";
+        assert_eq!(
+            clamp_max_tokens_for_overflow(Some(150000), msg),
+            Some(99000)
+        );
     }
 
     #[test]

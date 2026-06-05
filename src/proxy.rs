@@ -177,6 +177,10 @@ fn translation_policy(config: &Config) -> pipeline::TranslationPolicy {
 /// Max attempts per upstream URL (initial try + retries) for transient failures.
 const MAX_ATTEMPTS: usize = 3;
 
+/// Max context-overflow clamps per request. Each clamp uses the upstream's freshest
+/// (and usually more accurate) reported input count, so a couple of passes converge.
+const MAX_CLAMP_RETRIES: u32 = 2;
+
 fn is_retriable_status(status: u16) -> bool {
     matches!(status, 429 | 500..=599)
 }
@@ -269,7 +273,7 @@ async fn handle_non_streaming(
 ) -> ProxyResult<Response> {
     let urls = config.chat_completions_urls();
     let mut last_err = None;
-    let mut clamped = false;
+    let mut clamp_attempts = 0u32;
 
     for url in &urls {
         for attempt in 1..=MAX_ATTEMPTS {
@@ -311,7 +315,7 @@ async fn handle_non_streaming(
                     // Self-heal a context-length overflow once: clamp max_tokens so
                     // input + output fits the window, then retry. This unblocks the
                     // deadlock where even /compact can't run because it requests output.
-                    if status.as_u16() == 400 && !clamped {
+                    if status.as_u16() == 400 && clamp_attempts < MAX_CLAMP_RETRIES {
                         if let Some(new_max) =
                             core::clamp_max_tokens_for_overflow(openai_req.max_tokens, &message)
                         {
@@ -320,7 +324,7 @@ async fn handle_non_streaming(
                                 openai_req.max_tokens
                             );
                             openai_req.max_tokens = Some(new_max);
-                            clamped = true;
+                            clamp_attempts += 1;
                             continue;
                         }
                     }
@@ -414,7 +418,7 @@ async fn handle_streaming(
 ) -> ProxyResult<Response> {
     let urls = config.chat_completions_urls();
     let mut last_err = None;
-    let mut clamped = false;
+    let mut clamp_attempts = 0u32;
 
     // Only the connection handshake is retried; once bytes start streaming we are
     // committed (events may already have reached the client).
@@ -458,7 +462,7 @@ async fn handle_streaming(
                     // Self-heal a context-length overflow once: clamp max_tokens so
                     // input + output fits the window, then retry. This unblocks the
                     // deadlock where even /compact can't run because it requests output.
-                    if status.as_u16() == 400 && !clamped {
+                    if status.as_u16() == 400 && clamp_attempts < MAX_CLAMP_RETRIES {
                         if let Some(new_max) =
                             core::clamp_max_tokens_for_overflow(openai_req.max_tokens, &message)
                         {
@@ -467,7 +471,7 @@ async fn handle_streaming(
                                 openai_req.max_tokens
                             );
                             openai_req.max_tokens = Some(new_max);
-                            clamped = true;
+                            clamp_attempts += 1;
                             continue;
                         }
                     }
