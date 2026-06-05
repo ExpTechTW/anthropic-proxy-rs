@@ -254,6 +254,9 @@ UPSTREAM_BASE_URL=https://gateway.company.internal/v2 \
 ✅ Temperature, top_p, top_k  
 ✅ Stop sequences  
 ✅ Max tokens  
+✅ `tool_choice` (`auto`/`any`/`tool`/`none`, incl. `disable_parallel_tool_use`)  
+✅ `metadata.user_id` (forwarded as OpenAI `user`)  
+✅ `refusal` stop reason (mapped from upstream `content_filter`)  
 
 > **Note**: Make sure your upstream model supports tool use. Especially if you are using this proxy for coding agents like Claude Code.
 
@@ -264,15 +267,13 @@ The proxy automatically detects when a request includes the `thinking` parameter
 If model override variables are not set, the proxy uses the model specified in the client request.
 
 ## Known Limitations
-The following Anthropic API features are **not supported** currently (Claude Code and similar tools working without these parameters):):
+The following Anthropic API features are **not supported** currently (Claude Code and similar tools working without these parameters):
 
-- `tool_choice` parameter (always uses `auto`)
-- `service_tier` parameter
-- `metadata` parameter
-- `context_management` parameter
-- `container` parameter
+- `service_tier` parameter (no portable OpenAI-compatible equivalent)
+- `context_management` parameter (Anthropic server-side feature; no upstream equivalent)
+- `container` parameter (Anthropic code-execution sandbox; no upstream equivalent)
 - Citations in responses
-- `pause_turn` and `refusal` stop reasons
+- `pause_turn` stop reason (only emitted by Anthropic server-side tool loops, which this proxy does not relay)
 - Message Batches API
 - Files API
 - Admin API

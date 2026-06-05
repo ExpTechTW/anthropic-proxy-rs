@@ -77,15 +77,16 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
             }
 
             if !content_parts.is_empty() || !tool_calls.is_empty() || !reasoning_parts.is_empty() {
-                let content = if content_parts.is_empty() {
-                    None
-                } else if content_parts.len() == 1 {
-                    match &content_parts[0] {
+                let content = if content_parts.len() == 1 {
+                    // A lone text part collapses to a plain string; otherwise keep the parts array.
+                    match content_parts.pop().expect("len checked above") {
                         openai::ContentPart::Text { text } => {
-                            Some(openai::MessageContent::Text(text.clone()))
+                            Some(openai::MessageContent::Text(text))
                         }
-                        _ => Some(openai::MessageContent::Parts(content_parts)),
+                        other => Some(openai::MessageContent::Parts(vec![other])),
                     }
+                } else if content_parts.is_empty() {
+                    None
                 } else {
                     Some(openai::MessageContent::Parts(content_parts))
                 };
@@ -139,7 +140,7 @@ pub fn normalize_schema(schema: Value) -> Value {
 
             if let Some(properties) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
                 for (_, value) in properties.iter_mut() {
-                    *value = normalize_schema(value.clone());
+                    *value = normalize_schema(std::mem::take(value));
                 }
             }
 
@@ -153,14 +154,14 @@ pub fn normalize_schema(schema: Value) -> Value {
                 "else",
             ] {
                 if let Some(value) = obj.get_mut(key) {
-                    *value = normalize_schema(value.clone());
+                    *value = normalize_schema(std::mem::take(value));
                 }
             }
 
             for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
                 if let Some(values) = obj.get_mut(key).and_then(|v| v.as_array_mut()) {
                     for value in values.iter_mut() {
-                        *value = normalize_schema(value.clone());
+                        *value = normalize_schema(std::mem::take(value));
                     }
                 }
             }
@@ -235,10 +236,39 @@ pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
             "tool_calls" => "tool_use",
             "stop" => "end_turn",
             "length" => "max_tokens",
+            "content_filter" => "refusal",
             _ => "end_turn",
         }
         .to_string()
     })
+}
+
+/// Translate an Anthropic `tool_choice` into the OpenAI equivalent.
+///
+/// Returns `(tool_choice, parallel_tool_calls)` where `parallel_tool_calls` carries
+/// Anthropic's `disable_parallel_tool_use` (inverted to OpenAI's positive semantics).
+pub fn translate_tool_choice(choice: &Value) -> (Option<Value>, Option<bool>) {
+    let Some(obj) = choice.as_object() else {
+        return (None, None);
+    };
+
+    let parallel_tool_calls = obj
+        .get("disable_parallel_tool_use")
+        .and_then(Value::as_bool)
+        .map(|disabled| !disabled);
+
+    let tool_choice = match obj.get("type").and_then(Value::as_str) {
+        Some("auto") => Some(Value::from("auto")),
+        Some("any") => Some(Value::from("required")),
+        Some("none") => Some(Value::from("none")),
+        Some("tool") => obj
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| serde_json::json!({ "type": "function", "function": { "name": name } })),
+        _ => None,
+    };
+
+    (tool_choice, parallel_tool_calls)
 }
 
 fn match_term_at(text: &[u8], start: usize, tokens: &[Vec<u8>]) -> Option<usize> {
@@ -410,10 +440,57 @@ mod tests {
             Some("max_tokens".to_string())
         );
         assert_eq!(
+            map_stop_reason(Some("content_filter")),
+            Some("refusal".to_string())
+        );
+        assert_eq!(
             map_stop_reason(Some("unknown")),
             Some("end_turn".to_string())
         );
         assert_eq!(map_stop_reason(None), None);
+    }
+
+    #[test]
+    fn translate_tool_choice_maps_simple_variants() {
+        assert_eq!(
+            translate_tool_choice(&json!({"type": "auto"})),
+            (Some(json!("auto")), None)
+        );
+        assert_eq!(
+            translate_tool_choice(&json!({"type": "any"})),
+            (Some(json!("required")), None)
+        );
+        assert_eq!(
+            translate_tool_choice(&json!({"type": "none"})),
+            (Some(json!("none")), None)
+        );
+    }
+
+    #[test]
+    fn translate_tool_choice_maps_specific_tool() {
+        let (choice, parallel) = translate_tool_choice(&json!({"type": "tool", "name": "search"}));
+        assert_eq!(
+            choice,
+            Some(json!({"type": "function", "function": {"name": "search"}}))
+        );
+        assert_eq!(parallel, None);
+    }
+
+    #[test]
+    fn translate_tool_choice_inverts_disable_parallel() {
+        let (choice, parallel) =
+            translate_tool_choice(&json!({"type": "any", "disable_parallel_tool_use": true}));
+        assert_eq!(choice, Some(json!("required")));
+        assert_eq!(parallel, Some(false));
+    }
+
+    #[test]
+    fn translate_tool_choice_ignores_unknown_shapes() {
+        assert_eq!(translate_tool_choice(&json!("auto")), (None, None));
+        assert_eq!(
+            translate_tool_choice(&json!({"type": "tool"})),
+            (None, None)
+        );
     }
 
     #[test]

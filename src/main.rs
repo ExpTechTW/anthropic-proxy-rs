@@ -156,10 +156,17 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     let metrics_handle = metrics::install();
 
+    // Keep pooled idle connections short-lived and TCP-keepalive on: a socket the
+    // upstream/LB has silently closed is the main cause of intermittent 502s, so we
+    // bound how long a stale connection can linger in the pool before reuse.
+    // Request timeout aligns with the fronting nginx (proxy_read/send_timeout 600s);
+    // a tighter value here would abort long generations the gateway still allows.
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout(std::time::Duration::from_secs(600))
         .connect_timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(10)
+        .pool_idle_timeout(std::time::Duration::from_secs(30))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()?;
 
     let config = Arc::new(config);

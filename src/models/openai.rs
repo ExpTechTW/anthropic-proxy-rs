@@ -1,5 +1,16 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+/// Deserialize a field that may be absent *or* explicitly `null` into its `Default`.
+/// Guards against upstreams that send `"usage": null` (or omit it), which would
+/// otherwise abort response parsing and surface to the client as a 502.
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::deserialize(deserializer)?.unwrap_or_default())
+}
 
 /// OpenAI API request structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +33,10 @@ pub struct OpenAIRequest {
     pub tools: Option<Vec<Tool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +120,7 @@ pub struct OpenAIResponse {
     #[serde(default)]
     pub model: Option<String>,
     pub choices: Vec<Choice>,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_fingerprint: Option<String>,
@@ -120,17 +136,28 @@ pub struct Choice {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChoiceMessage {
+    #[serde(default)]
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    // Some upstreams surface chain-of-thought as `reasoning_content` (or `reasoning`)
+    // on the non-streaming message; preserve it as an Anthropic thinking block.
+    #[serde(default, alias = "reasoning")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Token usage. Defaulted field-by-field so upstreams that omit `usage`
+/// entirely, send it as `null`, or drop individual counts never break parsing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
+    #[serde(default)]
     pub prompt_tokens: u32,
+    #[serde(default)]
     pub completion_tokens: u32,
+    #[serde(default)]
     pub total_tokens: u32,
 }
 

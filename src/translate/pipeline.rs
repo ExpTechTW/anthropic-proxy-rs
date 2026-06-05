@@ -70,6 +70,14 @@ pub fn translate_request(
         }
     });
 
+    // tool_choice is only meaningful when tools are present; otherwise upstream rejects it.
+    let (tool_choice, parallel_tool_calls) = match (&tools, &req.tool_choice) {
+        (Some(_), Some(choice)) => core::translate_tool_choice(choice),
+        _ => (None, None),
+    };
+
+    let user = req.metadata.as_ref().and_then(extract_user_id);
+
     Ok(openai::OpenAIRequest {
         model,
         messages: openai_messages,
@@ -84,8 +92,18 @@ pub fn translate_request(
             })
         }),
         tools,
-        tool_choice: None,
+        tool_choice,
+        parallel_tool_calls,
+        user,
     })
+}
+
+/// Extract `metadata.user_id` (the only metadata field with an OpenAI equivalent).
+fn extract_user_id(metadata: &Value) -> Option<String> {
+    metadata
+        .get("user_id")
+        .and_then(Value::as_str)
+        .map(String::from)
 }
 
 pub fn translate_response(
@@ -98,6 +116,16 @@ pub fn translate_response(
         .ok_or_else(|| ProxyError::Transform("No choices in response".to_string()))?;
 
     let mut content = Vec::new();
+
+    // Thinking precedes the visible answer, matching Anthropic's block ordering.
+    if let Some(reasoning) = &choice.message.reasoning_content {
+        if !reasoning.is_empty() {
+            content.push(anthropic::ResponseContent::Thinking {
+                content_type: "thinking".to_string(),
+                thinking: reasoning.clone(),
+            });
+        }
+    }
 
     if let Some(text) = &choice.message.content {
         if !text.is_empty() {
@@ -122,16 +150,7 @@ pub fn translate_response(
         }
     }
 
-    let stop_reason = choice
-        .finish_reason
-        .as_ref()
-        .map(|r| match r.as_str() {
-            "tool_calls" => "tool_use",
-            "stop" => "end_turn",
-            "length" => "max_tokens",
-            _ => "end_turn",
-        })
-        .map(String::from);
+    let stop_reason = core::map_stop_reason(choice.finish_reason.as_deref());
 
     Ok(anthropic::AnthropicResponse {
         id: resp.id.unwrap_or_else(|| "msg_proxy".to_string()),
@@ -252,6 +271,7 @@ mod tests {
             stream: Some(false),
             tools: None,
             metadata: None,
+            tool_choice: None,
             extra: json!({}),
         };
 
@@ -285,6 +305,7 @@ mod tests {
             stream: Some(true),
             tools: None,
             metadata: None,
+            tool_choice: None,
             extra: json!({}),
         };
 
@@ -320,6 +341,7 @@ mod tests {
             stream: Some(true),
             tools: None,
             metadata: None,
+            tool_choice: None,
             extra: json!({}),
         };
 
@@ -348,6 +370,7 @@ mod tests {
             stream: Some(false),
             tools: None,
             metadata: None,
+            tool_choice: None,
             extra: json!({}),
         };
 
@@ -382,6 +405,7 @@ mod tests {
                 tool_type: None,
             }]),
             metadata: None,
+            tool_choice: None,
             extra: json!({}),
         };
 
@@ -415,6 +439,7 @@ mod tests {
                 tool_type: Some("BatchTool".to_string()),
             }]),
             metadata: None,
+            tool_choice: None,
             extra: json!({}),
         };
 
@@ -451,6 +476,7 @@ mod tests {
             stream: None,
             tools: None,
             metadata: None,
+            tool_choice: None,
             extra: json!({}),
         };
 
@@ -507,6 +533,7 @@ mod tests {
             stream: None,
             tools: None,
             metadata: None,
+            tool_choice: None,
             extra: json!({}),
         };
 
@@ -583,6 +610,7 @@ mod tests {
             stream: None,
             tools: None,
             metadata: None,
+            tool_choice: None,
             extra: json!({}),
         };
 
@@ -613,6 +641,7 @@ mod tests {
             stream: None,
             tools: None,
             metadata: None,
+            tool_choice: None,
             extra: json!({"thinking": {"type": "enabled", "budget_tokens": 1000}}),
         };
 
@@ -643,6 +672,7 @@ mod tests {
             stream: None,
             tools: None,
             metadata: None,
+            tool_choice: None,
             extra: json!({}),
         };
 
@@ -667,6 +697,7 @@ mod tests {
                 index: 0,
                 message: openai::ChoiceMessage {
                     role: "assistant".to_string(),
+                    reasoning_content: None,
                     content: Some("hello".to_string()),
                     tool_calls: None,
                 },
@@ -696,6 +727,7 @@ mod tests {
                 index: 0,
                 message: openai::ChoiceMessage {
                     role: "assistant".to_string(),
+                    reasoning_content: None,
                     content: Some("pong".to_string()),
                     tool_calls: None,
                 },
@@ -725,6 +757,7 @@ mod tests {
                 index: 0,
                 message: openai::ChoiceMessage {
                     role: "assistant".to_string(),
+                    reasoning_content: None,
                     content: None,
                     tool_calls: Some(vec![openai::ToolCall {
                         id: "call_abc".to_string(),
@@ -785,5 +818,236 @@ mod tests {
         let result = translate_models_list(response);
         assert!(result.data.is_empty());
         assert!(result.first_id.is_none());
+    }
+
+    fn base_request() -> anthropic::AnthropicRequest {
+        anthropic::AnthropicRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: 64,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            extra: json!({}),
+        }
+    }
+
+    fn weather_tool() -> anthropic::Tool {
+        anthropic::Tool {
+            name: "get_weather".to_string(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+            tool_type: None,
+        }
+    }
+
+    #[test]
+    fn translates_tool_choice_when_tools_present() {
+        let req = anthropic::AnthropicRequest {
+            tools: Some(vec![weather_tool()]),
+            tool_choice: Some(json!({"type": "tool", "name": "get_weather"})),
+            ..base_request()
+        };
+
+        let openai = translate_request(req, &default_policy()).unwrap();
+        assert_eq!(
+            openai.tool_choice,
+            Some(json!({"type": "function", "function": {"name": "get_weather"}}))
+        );
+    }
+
+    #[test]
+    fn drops_tool_choice_when_no_tools() {
+        let req = anthropic::AnthropicRequest {
+            tools: None,
+            tool_choice: Some(json!({"type": "auto"})),
+            ..base_request()
+        };
+
+        let openai = translate_request(req, &default_policy()).unwrap();
+        assert_eq!(openai.tool_choice, None);
+        assert_eq!(openai.parallel_tool_calls, None);
+    }
+
+    #[test]
+    fn forwards_disable_parallel_tool_use() {
+        let req = anthropic::AnthropicRequest {
+            tools: Some(vec![weather_tool()]),
+            tool_choice: Some(json!({"type": "auto", "disable_parallel_tool_use": true})),
+            ..base_request()
+        };
+
+        let openai = translate_request(req, &default_policy()).unwrap();
+        assert_eq!(openai.tool_choice, Some(json!("auto")));
+        assert_eq!(openai.parallel_tool_calls, Some(false));
+    }
+
+    #[test]
+    fn maps_metadata_user_id_to_user() {
+        let req = anthropic::AnthropicRequest {
+            metadata: Some(json!({"user_id": "user-123"})),
+            ..base_request()
+        };
+
+        let openai = translate_request(req, &default_policy()).unwrap();
+        assert_eq!(openai.user.as_deref(), Some("user-123"));
+    }
+
+    #[test]
+    fn metadata_without_user_id_leaves_user_unset() {
+        let req = anthropic::AnthropicRequest {
+            metadata: Some(json!({"other": "value"})),
+            ..base_request()
+        };
+
+        let openai = translate_request(req, &default_policy()).unwrap();
+        assert_eq!(openai.user, None);
+    }
+
+    #[test]
+    fn response_content_filter_maps_to_refusal() {
+        let response = openai::OpenAIResponse {
+            id: Some("chatcmpl-1".to_string()),
+            object: None,
+            created: None,
+            model: Some("gpt-4o".to_string()),
+            choices: vec![openai::Choice {
+                index: 0,
+                message: openai::ChoiceMessage {
+                    role: "assistant".to_string(),
+                    reasoning_content: None,
+                    content: Some("I can't help with that.".to_string()),
+                    tool_calls: None,
+                },
+                finish_reason: Some("content_filter".to_string()),
+            }],
+            usage: openai::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
+            system_fingerprint: None,
+        };
+
+        let anthropic = translate_response(response, "fallback").unwrap();
+        assert_eq!(anthropic.stop_reason, Some("refusal".to_string()));
+    }
+
+    // --- Upstream response robustness (regression guards against 502s) ---
+
+    fn parse_response(value: serde_json::Value) -> openai::OpenAIResponse {
+        serde_json::from_value(value).expect("upstream response should deserialize")
+    }
+
+    #[test]
+    fn response_parses_without_usage_field() {
+        let resp = parse_response(json!({
+            "id": "chatcmpl-1",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}]
+        }));
+        let anthropic = translate_response(resp, "fallback").unwrap();
+        assert_eq!(anthropic.usage.input_tokens, 0);
+        assert_eq!(anthropic.usage.output_tokens, 0);
+    }
+
+    #[test]
+    fn response_parses_with_null_usage() {
+        let resp = parse_response(json!({
+            "id": "chatcmpl-1",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}],
+            "usage": null
+        }));
+        let anthropic = translate_response(resp, "fallback").unwrap();
+        assert_eq!(anthropic.usage.input_tokens, 0);
+    }
+
+    #[test]
+    fn response_parses_with_partial_usage() {
+        // Missing total_tokens must not abort parsing.
+        let resp = parse_response(json!({
+            "id": "chatcmpl-1",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 11}
+        }));
+        let anthropic = translate_response(resp, "fallback").unwrap();
+        assert_eq!(anthropic.usage.input_tokens, 11);
+        assert_eq!(anthropic.usage.output_tokens, 0);
+    }
+
+    #[test]
+    fn response_parses_with_missing_role() {
+        let resp = parse_response(json!({
+            "id": "chatcmpl-1",
+            "choices": [{"index": 0, "message": {"content": "hi"}}]
+        }));
+        let anthropic = translate_response(resp, "fallback").unwrap();
+        assert_eq!(anthropic.content.len(), 1);
+    }
+
+    #[test]
+    fn response_ignores_unknown_fields() {
+        let resp = parse_response(json!({
+            "id": "chatcmpl-1",
+            "service_tier": "default",
+            "choices": [{
+                "index": 0,
+                "logprobs": null,
+                "message": {"role": "assistant", "content": "hi", "annotations": []}
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3,
+                      "prompt_tokens_details": {"cached_tokens": 1}}
+        }));
+        let anthropic = translate_response(resp, "fallback").unwrap();
+        assert_eq!(anthropic.usage.input_tokens, 1);
+        assert_eq!(anthropic.usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn response_reasoning_content_becomes_thinking_block() {
+        let resp = parse_response(json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "reasoning_content": "step 1", "content": "answer"},
+                "finish_reason": "stop"
+            }]
+        }));
+        let anthropic = translate_response(resp, "fallback").unwrap();
+        assert_eq!(anthropic.content.len(), 2);
+        assert!(matches!(
+            &anthropic.content[0],
+            anthropic::ResponseContent::Thinking { thinking, .. } if thinking == "step 1"
+        ));
+        assert!(matches!(
+            &anthropic.content[1],
+            anthropic::ResponseContent::Text { text, .. } if text == "answer"
+        ));
+    }
+
+    #[test]
+    fn response_reasoning_alias_is_accepted() {
+        let resp = parse_response(json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "reasoning": "thinking via alias", "content": ""},
+                "finish_reason": "length"
+            }]
+        }));
+        let anthropic = translate_response(resp, "fallback").unwrap();
+        assert_eq!(anthropic.content.len(), 1);
+        assert!(matches!(
+            &anthropic.content[0],
+            anthropic::ResponseContent::Thinking { thinking, .. } if thinking == "thinking via alias"
+        ));
     }
 }

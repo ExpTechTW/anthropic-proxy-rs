@@ -135,8 +135,70 @@ fn translation_policy(config: &Config) -> pipeline::TranslationPolicy {
     }
 }
 
+/// Max attempts per upstream URL (initial try + retries) for transient failures.
+const MAX_ATTEMPTS: usize = 3;
+
 fn is_retriable_status(status: u16) -> bool {
     matches!(status, 429 | 500..=599)
+}
+
+/// A transport-level reqwest error worth retrying with a fresh connection —
+/// notably "connection closed before message completed" from a stale pooled
+/// keep-alive socket, which is the dominant cause of intermittent 502s under load.
+fn is_transient(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout() || err.is_request() || err.is_body() || err.is_decode()
+}
+
+/// Outcome of a single upstream send attempt.
+enum SendOutcome {
+    /// 2xx response, ready to consume.
+    Ok(reqwest::Response),
+    /// Try the next attempt / next URL.
+    Retriable(ProxyError),
+    /// Non-retriable; surface to the client immediately.
+    Fatal(ProxyError),
+}
+
+/// Issue one POST to `url` and classify the result. The response body is left
+/// unread so streaming and non-streaming callers can consume it differently.
+async fn send_request(
+    client: &Client,
+    url: &str,
+    openai_req: &openai::OpenAIRequest,
+    api_key: Option<&str>,
+) -> SendOutcome {
+    let mut req_builder = client
+        .post(url)
+        .json(openai_req)
+        .timeout(Duration::from_secs(600));
+
+    if let Some(key) = api_key {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+    }
+
+    match req_builder.send().await {
+        Ok(resp) if resp.status().is_success() => SendOutcome::Ok(resp),
+        Ok(resp) => {
+            let status = resp.status();
+            let error_text = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            let err = ProxyError::Upstream(format!("Upstream returned {}: {}", status, error_text));
+            if is_retriable_status(status.as_u16()) {
+                SendOutcome::Retriable(err)
+            } else {
+                SendOutcome::Fatal(err)
+            }
+        }
+        Err(err) => {
+            if is_transient(&err) {
+                SendOutcome::Retriable(ProxyError::Http(err))
+            } else {
+                SendOutcome::Fatal(ProxyError::Http(err))
+            }
+        }
+    }
 }
 
 async fn handle_non_streaming(
@@ -149,85 +211,99 @@ async fn handle_non_streaming(
     let mut last_err = None;
 
     for url in &urls {
-        tracing::debug!(
-            "Sending non-streaming request to {} (model: {})",
-            url,
-            openai_req.model
-        );
+        for attempt in 1..=MAX_ATTEMPTS {
+            tracing::debug!(
+                "Non-streaming request to {} (model: {}, attempt {}/{})",
+                url,
+                openai_req.model,
+                attempt,
+                MAX_ATTEMPTS
+            );
 
-        let mut req_builder = client
-            .post(url)
-            .json(&openai_req)
-            .timeout(Duration::from_secs(300));
+            let upstream_start = Instant::now();
+            let response = match send_request(&client, url, &openai_req, api_key.as_deref()).await {
+                SendOutcome::Ok(resp) => {
+                    metrics::upstream_latency(
+                        upstream_start.elapsed().as_secs_f64(),
+                        "chat_completions",
+                    );
+                    resp
+                }
+                SendOutcome::Retriable(err) => {
+                    metrics::upstream_error("chat_completions");
+                    tracing::warn!(
+                        "Upstream {} attempt {}/{} failed: {}",
+                        url,
+                        attempt,
+                        MAX_ATTEMPTS,
+                        err
+                    );
+                    last_err = Some(err);
+                    continue;
+                }
+                SendOutcome::Fatal(err) => return Err(err),
+            };
 
-        if let Some(ref key) = api_key {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
-        }
+            // Read the body explicitly so a mid-body transport drop is retried
+            // rather than surfacing to the client as an unlogged 502.
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    metrics::upstream_error("chat_completions");
+                    tracing::warn!(
+                        "Upstream {} attempt {}/{} body read failed: {}",
+                        url,
+                        attempt,
+                        MAX_ATTEMPTS,
+                        err
+                    );
+                    last_err = Some(ProxyError::Http(err));
+                    continue;
+                }
+            };
 
-        let upstream_start = Instant::now();
-        let response = match req_builder.send().await {
-            Ok(resp) => {
-                metrics::upstream_latency(
-                    upstream_start.elapsed().as_secs_f64(),
-                    "chat_completions",
+            let openai_resp: openai::OpenAIResponse = match serde_json::from_slice(&bytes) {
+                Ok(resp) => resp,
+                Err(err) => {
+                    let preview: String =
+                        String::from_utf8_lossy(&bytes).chars().take(500).collect();
+                    tracing::error!(
+                        "Failed to parse upstream response from {}: {} (body: {})",
+                        url,
+                        err,
+                        preview
+                    );
+                    return Err(ProxyError::Upstream(format!(
+                        "Invalid upstream response: {}",
+                        err
+                    )));
+                }
+            };
+
+            metrics::tokens(
+                openai_resp.usage.prompt_tokens,
+                openai_resp.usage.completion_tokens,
+                &openai_req.model,
+            );
+
+            if config.verbose {
+                tracing::trace!(
+                    "Received OpenAI response: {}",
+                    serde_json::to_string_pretty(&openai_resp).unwrap_or_default()
                 );
-                resp
             }
-            Err(err) => {
-                tracing::warn!("Failed to reach {}: {:?}", url, err);
-                metrics::upstream_error("chat_completions");
-                last_err = Some(ProxyError::Http(err));
-                continue;
+
+            let anthropic_resp = pipeline::translate_response(openai_resp, &openai_req.model)?;
+
+            if config.verbose {
+                tracing::trace!(
+                    "Transformed Anthropic response: {}",
+                    serde_json::to_string_pretty(&anthropic_resp).unwrap_or_default()
+                );
             }
-        };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            tracing::warn!("Upstream {} returned {}: {}", url, status, error_text);
-            metrics::upstream_error("chat_completions");
-
-            if is_retriable_status(status.as_u16()) {
-                last_err = Some(ProxyError::Upstream(format!(
-                    "Upstream returned {}: {}",
-                    status, error_text
-                )));
-                continue;
-            }
-            return Err(ProxyError::Upstream(format!(
-                "Upstream returned {}: {}",
-                status, error_text
-            )));
+            return Ok(Json(anthropic_resp).into_response());
         }
-
-        let openai_resp: openai::OpenAIResponse = response.json().await?;
-
-        metrics::tokens(
-            openai_resp.usage.prompt_tokens,
-            openai_resp.usage.completion_tokens,
-            &openai_req.model,
-        );
-
-        if config.verbose {
-            tracing::trace!(
-                "Received OpenAI response: {}",
-                serde_json::to_string_pretty(&openai_resp).unwrap_or_default()
-            );
-        }
-
-        let anthropic_resp = pipeline::translate_response(openai_resp, &openai_req.model)?;
-
-        if config.verbose {
-            tracing::trace!(
-                "Transformed Anthropic response: {}",
-                serde_json::to_string_pretty(&anthropic_resp).unwrap_or_default()
-            );
-        }
-
-        return Ok(Json(anthropic_resp).into_response());
     }
 
     Err(last_err.unwrap_or_else(|| ProxyError::Upstream("All upstreams failed".to_string())))
@@ -242,73 +318,55 @@ async fn handle_streaming(
     let urls = config.chat_completions_urls();
     let mut last_err = None;
 
+    // Only the connection handshake is retried; once bytes start streaming we are
+    // committed (events may already have reached the client).
     for url in &urls {
-        tracing::debug!(
-            "Sending streaming request to {} (model: {})",
-            url,
-            openai_req.model
-        );
+        for attempt in 1..=MAX_ATTEMPTS {
+            tracing::debug!(
+                "Streaming request to {} (model: {}, attempt {}/{})",
+                url,
+                openai_req.model,
+                attempt,
+                MAX_ATTEMPTS
+            );
 
-        let mut req_builder = client
-            .post(url)
-            .json(&openai_req)
-            .timeout(Duration::from_secs(300));
+            let upstream_start = Instant::now();
+            let response = match send_request(&client, url, &openai_req, api_key.as_deref()).await {
+                SendOutcome::Ok(resp) => {
+                    metrics::upstream_latency(
+                        upstream_start.elapsed().as_secs_f64(),
+                        "chat_completions",
+                    );
+                    resp
+                }
+                SendOutcome::Retriable(err) => {
+                    metrics::upstream_error("chat_completions");
+                    tracing::warn!(
+                        "Upstream {} attempt {}/{} failed: {}",
+                        url,
+                        attempt,
+                        MAX_ATTEMPTS,
+                        err
+                    );
+                    last_err = Some(err);
+                    continue;
+                }
+                SendOutcome::Fatal(err) => return Err(err),
+            };
 
-        if let Some(ref key) = api_key {
-            req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+            let upstream = response.bytes_stream();
+            let sse_stream = create_sse_stream(upstream, openai_req.model.clone());
+
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "Content-Type",
+                HeaderValue::from_static("text/event-stream"),
+            );
+            headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
+            headers.insert("Connection", HeaderValue::from_static("keep-alive"));
+
+            return Ok((headers, Body::from_stream(sse_stream)).into_response());
         }
-
-        let upstream_start = Instant::now();
-        let response = match req_builder.send().await {
-            Ok(resp) => {
-                metrics::upstream_latency(
-                    upstream_start.elapsed().as_secs_f64(),
-                    "chat_completions",
-                );
-                resp
-            }
-            Err(err) => {
-                tracing::warn!("Failed to reach {}: {:?}", url, err);
-                metrics::upstream_error("chat_completions");
-                last_err = Some(ProxyError::Http(err));
-                continue;
-            }
-        };
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            tracing::warn!("Upstream {} returned {}: {}", url, status, error_text);
-            metrics::upstream_error("chat_completions");
-
-            if is_retriable_status(status.as_u16()) {
-                last_err = Some(ProxyError::Upstream(format!(
-                    "Upstream returned {}: {}",
-                    status, error_text
-                )));
-                continue;
-            }
-            return Err(ProxyError::Upstream(format!(
-                "Upstream returned {}: {}",
-                status, error_text
-            )));
-        }
-
-        let upstream = response.bytes_stream();
-        let sse_stream = create_sse_stream(upstream, openai_req.model.clone());
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "Content-Type",
-            HeaderValue::from_static("text/event-stream"),
-        );
-        headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
-        headers.insert("Connection", HeaderValue::from_static("keep-alive"));
-
-        return Ok((headers, Body::from_stream(sse_stream)).into_response());
     }
 
     Err(last_err.unwrap_or_else(|| ProxyError::Upstream("All upstreams failed".to_string())))
@@ -320,6 +378,18 @@ fn serialize_event(event: &anthropic::StreamEvent) -> String {
         event.event_type(),
         serde_json::to_string(event).unwrap_or_default()
     )
+}
+
+/// Locate the next complete SSE frame boundary, returning `(offset, separator_len)`.
+/// Handles both `\n\n` (the common case) and `\r\n\r\n` (CRLF upstreams), picking
+/// whichever blank line appears first so neither framing style stalls the stream.
+fn find_frame_boundary(buffer: &str) -> Option<(usize, usize)> {
+    match (buffer.find("\n\n"), buffer.find("\r\n\r\n")) {
+        (Some(lf), Some(crlf)) if lf <= crlf => Some((lf, 2)),
+        (_, Some(crlf)) => Some((crlf, 4)),
+        (Some(lf), None) => Some((lf, 2)),
+        (None, None) => None,
+    }
 }
 
 fn create_sse_stream(
@@ -340,9 +410,9 @@ fn create_sse_stream(
                     let text = String::from_utf8_lossy(&bytes);
                     buffer.push_str(&text);
 
-                    while let Some(pos) = buffer.find("\n\n") {
+                    while let Some((pos, sep_len)) = find_frame_boundary(&buffer) {
                         let line = buffer[..pos].to_string();
-                        buffer = buffer[pos + 2..].to_string();
+                        buffer = buffer[pos + sep_len..].to_string();
 
                         if line.trim().is_empty() {
                             continue;
@@ -780,6 +850,87 @@ mod tests {
             .collect();
         assert_eq!(text_deltas.len(), 1);
         assert_eq!(text_deltas[0]["delta"]["text"], "split");
+    }
+
+    #[tokio::test]
+    async fn crlf_framed_stream_is_parsed() {
+        // Some upstreams terminate SSE frames with CRLF (\r\n\r\n).
+        let frame = |body: &str| {
+            let chunk = json!({
+                "id": "chatcmpl-crlf", "model": "gpt-4o",
+                "choices": [{ "index": 0, "delta": { "content": body } }],
+            });
+            format!("data: {}\r\n\r\n", serde_json::to_string(&chunk).unwrap())
+        };
+        let chunks = vec![frame("CR"), frame("LF"), "data: [DONE]\r\n\r\n".to_string()];
+        let events = collect_events(chunks, "fallback").await;
+        let text: String = events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "text_delta")
+            .map(|e| e["delta"]["text"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(text, "CRLF");
+        assert_eq!(events.last().unwrap()["type"], "message_stop");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_comments_and_blank_lines_are_ignored() {
+        let chunks = vec![
+            ": keep-alive\n\n".to_string(),
+            "\n\n".to_string(),
+            openai_chunk("chatcmpl-hb", "gpt-4o", Some("hello"), None),
+            ": ping\n\n".to_string(),
+            openai_chunk("chatcmpl-hb", "gpt-4o", None, Some("stop")),
+            openai_done(),
+        ];
+        let events = collect_events(chunks, "fallback").await;
+        let text_deltas: Vec<_> = events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "text_delta")
+            .collect();
+        assert_eq!(text_deltas.len(), 1);
+        assert_eq!(text_deltas[0]["delta"]["text"], "hello");
+    }
+
+    #[tokio::test]
+    async fn malformed_json_chunk_is_skipped_without_aborting() {
+        let chunks = vec![
+            openai_chunk("chatcmpl-m", "gpt-4o", Some("good"), None),
+            "data: {not valid json}\n\n".to_string(),
+            openai_chunk("chatcmpl-m", "gpt-4o", Some(" still going"), None),
+            openai_chunk("chatcmpl-m", "gpt-4o", None, Some("stop")),
+            openai_done(),
+        ];
+        let events = collect_events(chunks, "fallback").await;
+        let text: String = events
+            .iter()
+            .filter(|e| e["delta"]["type"] == "text_delta")
+            .map(|e| e["delta"]["text"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(text, "good still going");
+        assert_eq!(events.last().unwrap()["type"], "message_stop");
+    }
+
+    #[tokio::test]
+    async fn stream_chunk_with_partial_usage_does_not_abort() {
+        // A finish chunk that carries usage with only some fields must still parse.
+        let finish = json!({
+            "id": "chatcmpl-u", "model": "gpt-4o",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            "usage": { "prompt_tokens": 9 }
+        });
+        let chunks = vec![
+            openai_chunk("chatcmpl-u", "gpt-4o", Some("hi"), None),
+            format!("data: {}\n\n", serde_json::to_string(&finish).unwrap()),
+            openai_done(),
+        ];
+        let events = collect_events(chunks, "fallback").await;
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .expect("message_delta present");
+        assert_eq!(delta["usage"]["input_tokens"], 9);
+        assert_eq!(delta["usage"]["output_tokens"], 0);
     }
 
     #[tokio::test]
