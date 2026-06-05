@@ -24,7 +24,7 @@ High-performance Rust proxy that translates the **Anthropic Messages API** into 
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/v1/messages` | Main completion endpoint (streaming + non-streaming). Also accepts a trailing slash. |
-| `POST` | `/v1/messages/count_tokens` | Local heuristic token estimate (upstreams expose no count endpoint) |
+| `POST` | `/v1/messages/count_tokens` | Token count — exact via the upstream `/tokenize` when enabled, otherwise a local BPE estimate |
 | `GET`  | `/v1/models` | Lists models reported by the upstream, translated to Anthropic shape |
 | `GET`  | `/health` | Liveness check (`OK`) |
 | `GET`  | `/metrics` | Prometheus metrics |
@@ -127,6 +127,37 @@ anthropic-proxy                                   # terminal 1
 ANTHROPIC_BASE_URL=http://localhost:3000 claude   # terminal 2
 ```
 
+### Recommended `settings.json`
+
+When your upstream model's context window is **smaller** than the Claude model name implies (e.g. a 105 K-token backend mapped to `claude-sonnet-4-5`, which Claude Code assumes is 200 K/1 M), Claude Code won't auto-compact until *far* past the real limit — and every request then fails with `context length exceeded`. Tell it the real window:
+
+Copy [`examples/claude-code-settings.json`](examples/claude-code-settings.json) into your Claude Code settings (`~/.claude/settings.json`, or a project-level `.claude/settings.json`):
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://your-proxy.example.com",
+    "ANTHROPIC_AUTH_TOKEN": "<your-upstream-api-key>",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "105120",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"
+  },
+  "model": "claude-sonnet-4-5"
+}
+```
+
+| Key | Why it matters |
+|-----|----------------|
+| `ANTHROPIC_BASE_URL` | Your proxy's URL. |
+| `ANTHROPIC_AUTH_TOKEN` | Sent as `x-api-key`; becomes the upstream key when the proxy runs in passthrough mode. |
+| **`CLAUDE_CODE_AUTO_COMPACT_WINDOW`** | **Set to the upstream model's real context window** (in tokens). This is the value auto-compaction is calculated against — without it, Claude Code uses the model-name default and compacts too late. |
+| **`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`** | Compact at this % of the window (default is ~95 %). `75` leaves comfortable headroom for the response. |
+
+> ⚠️ **Do not use `CLAUDE_CODE_MAX_CONTEXT_TOKENS` for this** — per the [Claude Code docs](https://code.claude.com/docs/en/env-vars) it only takes effect together with `DISABLE_COMPACT`. The variable that actually drives auto-compaction is `CLAUDE_CODE_AUTO_COMPACT_WINDOW`.
+>
+> If `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` appears to be ignored from `settings.json`, set it as a shell environment variable instead ([known issue](https://github.com/anthropics/claude-code/issues/63186)).
+
+Verify with `/context` — it should report your real window (e.g. `30.6k / 105.1k`) and an `Auto-compact window` line.
+
 ## Configuration
 
 ### Command-line options
@@ -170,6 +201,7 @@ Set via environment or a `.env` file:
 | `ANTHROPIC_PROXY_BIND` | No | `0.0.0.0` | Bind address. Use `127.0.0.1` to restrict to localhost. Binding to `0.0.0.0` logs a warning. |
 | `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS` | No | – | System-prompt terms to remove before forwarding (`;` or newline separated) |
 | `ANTHROPIC_PROXY_MODEL_MAP` | No | – | Exact model remapping before the upstream call (`source=target;other=target`) |
+| `ANTHROPIC_PROXY_UPSTREAM_TOKENIZE` | No | `false` | Use the upstream's vLLM-style `/tokenize` for **exact** `count_tokens` and accurate overflow clamping, instead of a local estimate |
 | `REASONING_MODEL` | No | (request model) | Model used when extended thinking is enabled\*\* |
 | `COMPLETION_MODEL` | No | (request model) | Model used for standard requests (no thinking)\*\* |
 | `DEBUG` | No | `false` | Debug logging (`1` or `true`) |
@@ -246,7 +278,8 @@ tail -f /tmp/anthropic-proxy.log    # logs
 ✅ `metadata.user_id` (forwarded as OpenAI `user`)
 ✅ `refusal` stop reason (mapped from upstream `content_filter`)
 ✅ Stop sequences, `max_tokens`, `temperature`, `top_p`
-✅ `POST /v1/messages/count_tokens` (local heuristic estimate; also accepts `?beta=true`)
+✅ `POST /v1/messages/count_tokens` — exact via the upstream `/tokenize` (when `ANTHROPIC_PROXY_UPSTREAM_TOKENIZE=true`), else a local BPE estimate; also accepts `?beta=true`
+✅ Streaming usage — real `input_tokens` / `output_tokens` / `cache_read_input_tokens` surfaced in `message_delta` (captured from the upstream's final usage chunk), with an upfront estimate in `message_start`
 ✅ Prompt-cache token accounting — upstream `prompt_tokens_details.cached_tokens` is reported as Anthropic `cache_read_input_tokens` (and excluded from `input_tokens`), so Claude Code's cache/cost stats are accurate
 
 > `top_k` is accepted but not forwarded — Chat Completions has no equivalent.
@@ -257,7 +290,7 @@ tail -f /tmp/anthropic-proxy.log    # logs
 
 - **Upstream status codes are preserved.** A client error (`400` invalid request, `401`/`403`/`404`, `413`, `429` rate limit) is surfaced with its original status and an Anthropic-shaped error body — `{"type":"error","error":{"type":...,"message":...}}` — instead of being masked as a generic `502`. Only genuine transport failures (no HTTP response) map to `502`.
 - **Transient failures are retried.** Connection / timeout / body-read errors and retriable statuses (`429`, `5xx`) are retried up to 3× per upstream URL with a fresh connection.
-- **Context-overflow auto-recovery.** If the upstream rejects a request because `input + max_tokens` exceeds the model's context window, the proxy clamps `max_tokens` to fit and retries once — so a conversation that's *just* over the limit (and even Claude Code's `/compact`, which otherwise dead-locks because it also requests output) can still complete instead of hard-failing on a `400`.
+- **Context-overflow auto-recovery.** If the upstream rejects a request because `input + max_tokens` exceeds the model's context window, the proxy re-tokenizes the actual request to learn the true input size (taking the larger of that and the error's own lower bound, so it always converges), clamps `max_tokens` to fit, and retries — so a conversation that's *just* over the limit (and even Claude Code's `/compact`, which otherwise dead-locks because it also requests output) completes instead of hard-failing on a `400`.
 - **Stale-connection hardening.** Pooled idle connections are kept short-lived with TCP keep-alive, eliminating the intermittent `502`s caused by reusing a socket the upstream silently closed.
 - **600 s request timeout**, matching a typical fronting nginx `proxy_read_timeout`, so long generations and streams are not cut short.
 
@@ -302,7 +335,7 @@ The following Anthropic API features are **not supported** (Claude Code and simi
 - Files API
 - Admin API
 
-`count_tokens` returns a **heuristic estimate** (~4 bytes/token), not an exact tokenizer count — upstreams expose no count endpoint.
+Without `ANTHROPIC_PROXY_UPSTREAM_TOKENIZE`, `count_tokens` returns a **local BPE estimate** rather than an exact count. Enable it to get exact counts from a vLLM-style `/tokenize` endpoint.
 
 ## Troubleshooting
 

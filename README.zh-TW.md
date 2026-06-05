@@ -24,7 +24,7 @@
 | 方法 | 路徑 | 說明 |
 |------|------|------|
 | `POST` | `/v1/messages` | 主要對話端點(串流 + 非串流);也接受結尾斜線 |
-| `POST` | `/v1/messages/count_tokens` | 本地啟發式 token 估算(上游沒有計數端點) |
+| `POST` | `/v1/messages/count_tokens` | Token 計數 —— 啟用時透過上游 `/tokenize` 精確計算,否則用本地 BPE 估算 |
 | `GET`  | `/v1/models` | 列出上游回報的模型,翻譯成 Anthropic 格式 |
 | `GET`  | `/health` | 存活檢查(回 `OK`) |
 | `GET`  | `/metrics` | Prometheus 指標 |
@@ -127,6 +127,37 @@ anthropic-proxy                                   # 終端機 1
 ANTHROPIC_BASE_URL=http://localhost:3000 claude   # 終端機 2
 ```
 
+### 建議的 `settings.json`
+
+當上游模型的 context 視窗**比 Claude 模型名稱所暗示的小**(例如把 105K token 的後端對映到 `claude-sonnet-4-5`,而 Claude Code 以為它是 200K/1M),Claude Code 會**遠遠超過**真實上限才自動壓縮 —— 接著每個請求都會 `context length exceeded` 失敗。要告訴它真實視窗:
+
+把 [`examples/claude-code-settings.json`](examples/claude-code-settings.json) 複製到你的 Claude Code 設定(`~/.claude/settings.json`,或專案層級的 `.claude/settings.json`):
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://your-proxy.example.com",
+    "ANTHROPIC_AUTH_TOKEN": "<your-upstream-api-key>",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "105120",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"
+  },
+  "model": "claude-sonnet-4-5"
+}
+```
+
+| 設定 | 為什麼重要 |
+|------|-----------|
+| `ANTHROPIC_BASE_URL` | 你的代理 URL。 |
+| `ANTHROPIC_AUTH_TOKEN` | 以 `x-api-key` 送出;代理在 passthrough 模式下會用它當上游金鑰。 |
+| **`CLAUDE_CODE_AUTO_COMPACT_WINDOW`** | **設成上游模型的真實 context 視窗**(token 數)。自動壓縮就是用這個值計算的 —— 沒設的話 Claude Code 會用模型名稱的預設值,壓縮得太晚。 |
+| **`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`** | 在視窗的幾 % 觸發壓縮(預設約 95%)。`75` 會留下舒適的回應空間。 |
+
+> ⚠️ **別用 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 來做這件事** —— 依[官方文件](https://code.claude.com/docs/en/env-vars),它只有在同時設定 `DISABLE_COMPACT` 時才生效。真正驅動自動壓縮的是 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`。
+>
+> 若 `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` 在 `settings.json` 裡看起來沒生效,改設成 shell 環境變數([已知問題](https://github.com/anthropics/claude-code/issues/63186))。
+
+用 `/context` 驗證 —— 它應該顯示你的真實視窗(例如 `30.6k / 105.1k`)以及一行 `Auto-compact window`。
+
 ## 設定
 
 ### 命令列選項
@@ -170,6 +201,7 @@ anthropic-proxy --help
 | `ANTHROPIC_PROXY_BIND` | 否 | `0.0.0.0` | 綁定位址。設 `127.0.0.1` 可限制只在本機。綁 `0.0.0.0` 會記錄警告。 |
 | `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS` | 否 | – | 轉發前要移除的 system prompt 詞彙(`;` 或換行分隔) |
 | `ANTHROPIC_PROXY_MODEL_MAP` | 否 | – | 上游呼叫前的精確模型對映(`source=target;other=target`) |
+| `ANTHROPIC_PROXY_UPSTREAM_TOKENIZE` | 否 | `false` | 用上游 vLLM 風格的 `/tokenize` 取得**精確**的 `count_tokens` 與準確的溢出夾值,而非本地估算 |
 | `REASONING_MODEL` | 否 | (請求模型) | 啟用延伸思考時使用的模型\*\* |
 | `COMPLETION_MODEL` | 否 | (請求模型) | 一般請求(無思考)使用的模型\*\* |
 | `DEBUG` | 否 | `false` | 除錯日誌(`1` 或 `true`) |
@@ -246,7 +278,8 @@ tail -f /tmp/anthropic-proxy.log    # 日誌
 ✅ `metadata.user_id`(轉成 OpenAI 的 `user`)
 ✅ `refusal` 停止原因(由上游 `content_filter` 對映)
 ✅ 停止序列、`max_tokens`、`temperature`、`top_p`
-✅ `POST /v1/messages/count_tokens`(本地啟發式估算;也接受 `?beta=true`)
+✅ `POST /v1/messages/count_tokens` —— 啟用 `ANTHROPIC_PROXY_UPSTREAM_TOKENIZE=true` 時透過上游 `/tokenize` 精確計算,否則用本地 BPE 估算;也接受 `?beta=true`
+✅ 串流 usage —— 真實的 `input_tokens` / `output_tokens` / `cache_read_input_tokens` 會在 `message_delta` 回報(從上游最後的 usage chunk 擷取),並在 `message_start` 先給一個估算值
 ✅ Prompt 快取 token 計量 —— 上游的 `prompt_tokens_details.cached_tokens` 會回報為 Anthropic 的 `cache_read_input_tokens`(並從 `input_tokens` 扣除),讓 Claude Code 的快取/成本統計正確
 
 > `top_k` 會被接受但不會轉發 —— Chat Completions 沒有對應參數。
@@ -257,7 +290,7 @@ tail -f /tmp/anthropic-proxy.log    # 日誌
 
 - **保留上游狀態碼。** 客戶端錯誤(`400` 請求錯誤、`401`/`403`/`404`、`413`、`429` 限流)會以原始狀態碼與 Anthropic 格式錯誤內容回傳 —— `{"type":"error","error":{"type":...,"message":...}}` —— 而不是一律被遮成 `502`。只有真正的傳輸失敗(沒有 HTTP 回應)才會對映成 `502`。
 - **暫時性失敗自動重試。** 連線/逾時/讀取 body 錯誤,以及可重試狀態(`429`、`5xx`),每個上游 URL 最多以全新連線重試 3 次。
-- **Context 溢出自動回復。** 若上游因 `input + max_tokens` 超過模型 context 視窗而拒絕,代理會把 `max_tokens` 夾到剛好放得下並重試一次 —— 讓「剛好超過上限」的對話(以及 Claude Code 的 `/compact`,它本身也要求輸出而會卡死)還是能完成,而非直接 `400` 失敗。
+- **Context 溢出自動回復。** 若上游因 `input + max_tokens` 超過模型 context 視窗而拒絕,代理會重新 tokenize 實際請求以取得真實輸入大小(並取「它」與「錯誤訊息自身的下界」之中較大者,確保一定收斂),把 `max_tokens` 夾到剛好放得下並重試 —— 讓「剛好超過上限」的對話(以及 Claude Code 的 `/compact`,它本身也要求輸出而會卡死)還是能完成,而非直接 `400` 失敗。
 - **過期連線強化。** 連線池的閒置連線維持短壽命並開啟 TCP keep-alive,消除「重用被上游靜默關閉的 socket」造成的間歇性 `502`。
 - **600 秒請求逾時**,與前方常見的 nginx `proxy_read_timeout` 對齊,長生成與串流不會被提前截斷。
 
@@ -302,7 +335,7 @@ location / {
 - Files API
 - Admin API
 
-`count_tokens` 回傳的是**啟發式估算**(約 4 bytes/token),並非精確 tokenizer 計數 —— 上游沒有計數端點。
+未啟用 `ANTHROPIC_PROXY_UPSTREAM_TOKENIZE` 時,`count_tokens` 回傳的是**本地 BPE 估算**,而非精確計數。啟用後即可透過 vLLM 風格的 `/tokenize` 取得精確計數。
 
 ## 疑難排解
 
