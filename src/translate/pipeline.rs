@@ -202,6 +202,51 @@ pub fn estimate_input_tokens(req: &anthropic::CountTokensRequest) -> u32 {
     ((tokens * 23 / 20).max(1)) as u32
 }
 
+/// Heuristic input-token estimate for an already-translated OpenAI request. Used to fill
+/// `input_tokens` in the streaming `message_start` — the upstream only reports real usage
+/// in the final chunk (too late for message_start), but Claude Code reads input from
+/// message_start to track context. Mirrors [`estimate_input_tokens`], safety factor included.
+pub fn estimate_openai_input_tokens(req: &openai::OpenAIRequest) -> u32 {
+    let mut tokens = 0usize;
+
+    for msg in &req.messages {
+        tokens += estimate_text_tokens(&msg.role);
+        match &msg.content {
+            Some(openai::MessageContent::Text(text)) => tokens += estimate_text_tokens(text),
+            Some(openai::MessageContent::Parts(parts)) => {
+                for part in parts {
+                    if let openai::ContentPart::Text { text } = part {
+                        tokens += estimate_text_tokens(text);
+                    }
+                }
+            }
+            None => {}
+        }
+        if let Some(reasoning) = &msg.reasoning_content {
+            tokens += estimate_text_tokens(reasoning);
+        }
+        if let Some(tool_calls) = &msg.tool_calls {
+            for call in tool_calls {
+                tokens += estimate_text_tokens(&call.function.name);
+                tokens += estimate_text_tokens(&call.function.arguments);
+            }
+        }
+        tokens += PER_MESSAGE_OVERHEAD;
+    }
+
+    if let Some(tools) = &req.tools {
+        for tool in tools {
+            tokens += estimate_text_tokens(&tool.function.name);
+            if let Some(description) = &tool.function.description {
+                tokens += estimate_text_tokens(description);
+            }
+            tokens += estimate_text_tokens(&tool.function.parameters.to_string());
+        }
+    }
+
+    ((tokens * 23 / 20).max(1)) as u32
+}
+
 /// Concatenate all countable text (system + message content + tool schemas) into a
 /// single string for an upstream `/tokenize` call, returning it with the message count
 /// (used to add the per-message chat-template overhead). Base64 images are excluded.

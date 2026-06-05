@@ -230,24 +230,20 @@ pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
     })
 }
 
-/// If `message` is an OpenAI-style "maximum context length" error and the prompt
-/// still leaves room for output, return a reduced `max_tokens` that fits the window.
+/// Given the window size, the (true) input token count, and the current `max_tokens`,
+/// return a reduced `max_tokens` that leaves the prompt room to fit — or `None` when the
+/// prompt alone already fills the window (nothing an output clamp can fix) or no reduction
+/// is needed.
 ///
 /// This breaks the deadlock where a conversation is just over the limit: the upstream
-/// rejects `input + max_tokens > context`, but `input` alone still fits, so trimming
-/// the *output* budget lets the request through (including Claude Code's `/compact`,
-/// which otherwise can't run because it too requests output). Returns `None` when the
-/// error isn't a parseable context overflow or the prompt alone already fills the
-/// window (nothing an output clamp can fix).
-pub fn clamp_max_tokens_for_overflow(current_max: Option<u32>, message: &str) -> Option<u32> {
+/// rejects `input + max_tokens > context`, but `input` alone still fits, so trimming the
+/// *output* budget lets the request through (including Claude Code's `/compact`, which
+/// otherwise can't run because it too requests output). Headroom is ~2% of the window
+/// (min 1024) to absorb any residual tokenizer drift between our count and the upstream's.
+pub fn fit_output_to_window(context: u32, input: u32, current_max: Option<u32>) -> Option<u32> {
     const MIN_OUTPUT: u32 = 256;
 
-    let (context, input) = parse_context_overflow(message)?;
-    // Headroom of ~2% of the window (min 256). The upstream reports input as "at least N",
-    // a loose lower bound that under-reports the true count — observed off by ~1% (88737
-    // reported vs 89789 actual). The margin must exceed that gap so the *first* clamp fits;
-    // the caller's re-clamp is only a fallback for the rare case it doesn't.
-    let margin = (context / 50).max(MIN_OUTPUT);
+    let margin = (context / 50).max(1024);
     let available = context.checked_sub(input)?.checked_sub(margin)?;
     let current = current_max.unwrap_or(u32::MAX);
 
@@ -255,7 +251,9 @@ pub fn clamp_max_tokens_for_overflow(current_max: Option<u32>, message: &str) ->
 }
 
 /// Parse `(max_context_tokens, input_tokens)` from an OpenAI-style overflow message.
-fn parse_context_overflow(message: &str) -> Option<(u32, u32)> {
+/// The `input_tokens` here is the upstream's *loose lower bound* (`context+1 - max_tokens`),
+/// not the true prompt size — callers that can tokenize the request should prefer that.
+pub fn parse_context_overflow(message: &str) -> Option<(u32, u32)> {
     let context = leading_number(message.split_once("context length is ")?.1)?;
     let input = message
         .split_once("contains at least ")
@@ -546,59 +544,48 @@ mod tests {
 
     #[test]
     fn clamp_reduces_max_tokens_to_fit_context() {
-        // The real deadlock: 88737 input + 16384 output = 105121 > 105120.
-        let msg = "This model's maximum context length is 105120 tokens. However, you \
-                   requested 16384 output tokens and your prompt contains at least 88737 \
-                   input tokens, for a total of at least 105121 tokens.";
-        // margin = max(105120/50, 256) = 2102; available = 105120 - 88737 - 2102 = 14281
-        let clamped = clamp_max_tokens_for_overflow(Some(16384), msg).unwrap();
-        assert_eq!(clamped, 14281);
-        assert!(88737 + clamped <= 105120);
+        // The real deadlock: input + 16384 output > 105120. We clamp against the TRUE input
+        // (from the tokenizer), here 95011, not the error's loose lower bound.
+        // margin = max(105120/50, 1024) = 2102; available = 105120 - 95011 - 2102 = 8007
+        let clamped = fit_output_to_window(105120, 95011, Some(16384)).unwrap();
+        assert_eq!(clamped, 8007);
+        assert!(95011 + clamped <= 105120);
     }
 
     #[test]
-    fn clamp_absorbs_underreported_input() {
-        // The field failure: the first error under-reports input as 88737, but the true
-        // input is 89789 (revealed only as max_tokens shrinks). The 2% margin must keep the
-        // FIRST clamped retry under the cap despite that ~1052-token gap.
-        let msg =
-            "maximum context length is 105120 tokens ... contains at least 88737 input tokens";
-        let clamped = clamp_max_tokens_for_overflow(Some(16384), msg).unwrap();
-        assert!(
-            89789 + clamped <= 105120,
-            "clamped={clamped} overflows real input"
-        );
+    fn clamp_parses_context_and_input_from_error() {
+        let msg = "This model's maximum context length is 105120 tokens. However, you \
+                   requested 16384 output tokens and your prompt contains at least 88737 \
+                   input tokens, for a total of at least 105121 tokens.";
+        assert_eq!(parse_context_overflow(msg), Some((105120, 88737)));
     }
 
     #[test]
     fn clamp_none_when_prompt_alone_exceeds_window() {
-        let msg = "This model's maximum context length is 1000 tokens and your prompt \
-                   contains at least 1200 input tokens.";
-        assert_eq!(clamp_max_tokens_for_overflow(Some(500), msg), None);
+        assert_eq!(fit_output_to_window(1000, 1200, Some(500)), None);
     }
 
     #[test]
     fn clamp_none_for_unrelated_errors() {
-        assert_eq!(
-            clamp_max_tokens_for_overflow(Some(16384), "invalid api key"),
-            None
-        );
+        assert_eq!(parse_context_overflow("invalid api key"), None);
     }
 
     #[test]
     fn clamp_none_when_available_not_smaller_than_current() {
         // Plenty of room — no need to clamp a small request.
-        let msg = "maximum context length is 105120 tokens; contains at least 1000 input tokens";
-        assert_eq!(clamp_max_tokens_for_overflow(Some(8000), msg), None);
+        // available = 105120 - 1000 - 2102 = 102018, which is not < current (8000).
+        assert_eq!(fit_output_to_window(105120, 1000, Some(8000)), None);
     }
 
     #[test]
     fn clamp_parses_input_via_trailing_fallback() {
         // No "contains at least" phrasing — fall back to "<n> input tokens".
-        // margin = max(200000/50, 256) = 4000; available = 200000 - 100000 - 4000 = 96000
         let msg = "maximum context length is 200000 tokens, but you have 100000 input tokens";
+        let (context, input) = parse_context_overflow(msg).unwrap();
+        assert_eq!((context, input), (200000, 100000));
+        // margin = max(200000/50, 1024) = 4000; available = 200000 - 100000 - 4000 = 96000
         assert_eq!(
-            clamp_max_tokens_for_overflow(Some(150000), msg),
+            fit_output_to_window(context, input, Some(150000)),
             Some(96000)
         );
     }

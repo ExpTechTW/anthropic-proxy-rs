@@ -238,6 +238,104 @@ async fn tokenize_prompt(
     Some(tokenized.count + message_count as u32 * pipeline::PER_MESSAGE_OVERHEAD_TOKENS)
 }
 
+/// Compute a `max_tokens` that actually fits the context window after an overflow 400.
+///
+/// The upstream error reports input as "at least N", but that N is a *loose lower bound*
+/// equal to `context + 1 - max_tokens` — it rises as we shrink `max_tokens`, so the old
+/// "subtract a margin from the reported input" approach just crawls and never converges
+/// (observed: 88737 → 90840 → 92943 across retries while the real input was ~95k). Here we
+/// tokenize the *actual outgoing request* to get the true input size and clamp in one shot.
+/// Falls back to the error's lower bound only if tokenization is unavailable. Returns
+/// `None` when the prompt alone already fills the window (only compaction can fix that).
+async fn clamp_for_overflow(
+    client: &Client,
+    config: &Config,
+    openai: &openai::OpenAIRequest,
+    api_key: Option<&str>,
+    message: &str,
+) -> Option<u32> {
+    let (context, error_input) = core::parse_context_overflow(message)?;
+
+    let input = match config.tokenize_urls().into_iter().next() {
+        Some(url) => tokenize_openai_input(client, &url, openai, api_key)
+            .await
+            .unwrap_or(error_input),
+        None => error_input,
+    };
+
+    core::fit_output_to_window(context, input, openai.max_tokens)
+}
+
+/// Tokenize an outgoing chat request to get its true input size. Prefers the chat-aware
+/// `/tokenize` (template applied); falls back to tokenizing the concatenated message/tool
+/// text plus per-message overhead so it still works on gateways without `messages` support.
+async fn tokenize_openai_input(
+    client: &Client,
+    url: &str,
+    openai: &openai::OpenAIRequest,
+    api_key: Option<&str>,
+) -> Option<u32> {
+    if let Some(count) = tokenize_chat(client, url, openai, api_key).await {
+        return Some(count);
+    }
+    let (prompt, message_count) = openai_tokenize_text(openai);
+    let mut req_builder = client
+        .post(url)
+        .json(&openai::TokenizeRequest {
+            model: openai.model.clone(),
+            prompt,
+        })
+        .timeout(Duration::from_secs(30));
+    if let Some(key) = api_key {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+    }
+    let response = req_builder.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let tokenized: openai::TokenizeResponse = response.json().await.ok()?;
+    Some(tokenized.count + message_count as u32 * pipeline::PER_MESSAGE_OVERHEAD_TOKENS)
+}
+
+/// Flatten an OpenAI request to the text that contributes to the prompt (message content,
+/// reasoning, tool-call arguments, and tool schemas) plus the message count. Base64 image
+/// parts are skipped — they are not text and would massively over-count.
+fn openai_tokenize_text(openai: &openai::OpenAIRequest) -> (String, usize) {
+    let mut parts: Vec<String> = Vec::new();
+    for m in &openai.messages {
+        match &m.content {
+            Some(openai::MessageContent::Text(t)) => parts.push(t.clone()),
+            Some(openai::MessageContent::Parts(ps)) => {
+                for p in ps {
+                    if let openai::ContentPart::Text { text } = p {
+                        parts.push(text.clone());
+                    }
+                }
+            }
+            None => {}
+        }
+        if let Some(rc) = &m.reasoning_content {
+            parts.push(rc.clone());
+        }
+        if let Some(tcs) = &m.tool_calls {
+            for tc in tcs {
+                parts.push(tc.function.name.clone());
+                parts.push(tc.function.arguments.clone());
+            }
+        }
+    }
+    if let Some(tools) = &openai.tools {
+        for t in tools {
+            parts.push(t.function.name.clone());
+            if let Some(d) = &t.function.description {
+                parts.push(d.clone());
+            }
+            parts.push(t.function.parameters.to_string());
+        }
+    }
+    (parts.join("\n"), openai.messages.len())
+}
+
 pub async fn list_models_handler(
     Extension(config): Extension<Arc<Config>>,
     Extension(client): Extension<Client>,
@@ -453,8 +551,14 @@ async fn handle_non_streaming(
                     // input + output fits the window, then retry. This unblocks the
                     // deadlock where even /compact can't run because it requests output.
                     if status.as_u16() == 400 && clamp_attempts < MAX_CLAMP_RETRIES {
-                        if let Some(new_max) =
-                            core::clamp_max_tokens_for_overflow(openai_req.max_tokens, &message)
+                        if let Some(new_max) = clamp_for_overflow(
+                            &client,
+                            &config,
+                            &openai_req,
+                            api_key.as_deref(),
+                            &message,
+                        )
+                        .await
                         {
                             tracing::warn!(
                                 "upstream {url} context overflow; clamping max_tokens {:?} -> {new_max} and retrying",
@@ -600,8 +704,14 @@ async fn handle_streaming(
                     // input + output fits the window, then retry. This unblocks the
                     // deadlock where even /compact can't run because it requests output.
                     if status.as_u16() == 400 && clamp_attempts < MAX_CLAMP_RETRIES {
-                        if let Some(new_max) =
-                            core::clamp_max_tokens_for_overflow(openai_req.max_tokens, &message)
+                        if let Some(new_max) = clamp_for_overflow(
+                            &client,
+                            &config,
+                            &openai_req,
+                            api_key.as_deref(),
+                            &message,
+                        )
+                        .await
                         {
                             tracing::warn!(
                                 "upstream {url} context overflow; clamping max_tokens {:?} -> {new_max} and retrying",
@@ -630,7 +740,8 @@ async fn handle_streaming(
             };
 
             let upstream = response.bytes_stream();
-            let sse_stream = create_sse_stream(upstream, openai_req.model.clone());
+            let input_estimate = pipeline::estimate_openai_input_tokens(&openai_req);
+            let sse_stream = create_sse_stream(upstream, openai_req.model.clone(), input_estimate);
 
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -672,10 +783,11 @@ fn create_sse_stream(
         + Send
         + 'static,
     fallback_model: String,
+    input_estimate: u32,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
-        let mut state = stream::initial_state(fallback_model);
+        let mut state = stream::initial_state(fallback_model, input_estimate);
 
         tokio::pin!(upstream);
 
@@ -721,6 +833,12 @@ fn create_sse_stream(
                     break;
                 }
             }
+        }
+
+        // Safety net: if the upstream closed without a `[DONE]` marker, still emit the
+        // closing message_delta (with usage) + message_stop. No-op if already finalized.
+        for event in stream::translate_done(&mut state) {
+            yield Ok(Bytes::from(serialize_event(&event)));
         }
     }
 }
@@ -828,7 +946,7 @@ mod tests {
 
     async fn collect_events(chunks: Vec<String>, model: &str) -> Vec<Value> {
         let s = make_stream(chunks);
-        let sse = create_sse_stream(s, model.to_string());
+        let sse = create_sse_stream(s, model.to_string(), 0);
         tokio::pin!(sse);
 
         let mut events = Vec::new();
@@ -1107,7 +1225,7 @@ mod tests {
             Err(TestError),
         ];
         let s = stream::iter(items);
-        let sse = create_sse_stream(s, "fallback".to_string());
+        let sse = create_sse_stream(s, "fallback".to_string(), 0);
         tokio::pin!(sse);
 
         let mut events = Vec::new();
