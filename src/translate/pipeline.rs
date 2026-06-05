@@ -20,35 +20,21 @@ pub fn translate_request(
     let mut openai_messages = Vec::new();
 
     if let Some(system) = req.system {
-        match system {
-            anthropic::SystemPrompt::Single(text) => {
-                openai_messages.push(openai::Message {
-                    role: "system".to_string(),
-                    content: Some(openai::MessageContent::Text(sanitize_prompt(
-                        text,
-                        &policy.ignore_terms,
-                    ))),
-                    reasoning_content: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                });
-            }
+        let texts = match system {
+            anthropic::SystemPrompt::Single(text) => vec![text],
             anthropic::SystemPrompt::Multiple(messages) => {
-                for msg in messages {
-                    openai_messages.push(openai::Message {
-                        role: "system".to_string(),
-                        content: Some(openai::MessageContent::Text(sanitize_prompt(
-                            msg.text,
-                            &policy.ignore_terms,
-                        ))),
-                        reasoning_content: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        name: None,
-                    });
-                }
+                messages.into_iter().map(|m| m.text).collect()
             }
+        };
+        for text in texts {
+            openai_messages.push(openai::Message {
+                role: "system".to_string(),
+                content: Some(openai::MessageContent::Text(sanitize_prompt(
+                    text,
+                    &policy.ignore_terms,
+                ))),
+                ..Default::default()
+            });
         }
     }
 

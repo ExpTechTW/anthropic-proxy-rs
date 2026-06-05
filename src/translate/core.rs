@@ -10,10 +10,7 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
             result.push(openai::Message {
                 role: msg.role,
                 content: Some(openai::MessageContent::Text(text)),
-                reasoning_content: None,
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
+                ..Default::default()
             });
         }
         anthropic::MessageContent::Blocks(blocks) => {
@@ -62,10 +59,8 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
                         result.push(openai::Message {
                             role: "tool".to_string(),
                             content: Some(openai::MessageContent::Text(text)),
-                            reasoning_content: None,
-                            tool_calls: None,
                             tool_call_id: Some(tool_use_id),
-                            name: None,
+                            ..Default::default()
                         });
                     }
                     anthropic::ContentBlock::Thinking { thinking } => {
@@ -94,18 +89,10 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
                 result.push(openai::Message {
                     role: msg.role,
                     content,
-                    reasoning_content: if reasoning_parts.is_empty() {
-                        None
-                    } else {
-                        Some(reasoning_parts.join(""))
-                    },
-                    tool_calls: if tool_calls.is_empty() {
-                        None
-                    } else {
-                        Some(tool_calls)
-                    },
-                    tool_call_id: None,
-                    name: None,
+                    reasoning_content: (!reasoning_parts.is_empty())
+                        .then(|| reasoning_parts.join("")),
+                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                    ..Default::default()
                 });
             }
         }

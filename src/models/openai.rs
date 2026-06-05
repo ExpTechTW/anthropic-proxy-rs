@@ -44,7 +44,7 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: Option<MessageContent>,

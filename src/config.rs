@@ -66,11 +66,6 @@ impl Config {
         None
     }
 
-    #[allow(dead_code)]
-    pub fn from_env() -> Result<Self> {
-        Self::from_env_with_path(None)
-    }
-
     pub fn from_env_with_path(custom_path: Option<PathBuf>) -> Result<Self> {
         if let Some(path) = Self::load_dotenv(custom_path) {
             eprintln!("📄 Loaded config from: {}", path.display());

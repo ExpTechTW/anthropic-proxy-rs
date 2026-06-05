@@ -23,11 +23,11 @@ pub async fn proxy_handler(
 ) -> ProxyResult<Response> {
     let is_streaming = req.stream.unwrap_or(false);
     let start = Instant::now();
+    let client_model = req.model.clone();
 
     let api_key = resolve_api_key(&config, &headers);
 
-    tracing::debug!("Received request for model: {}", req.model);
-    tracing::debug!("Streaming: {}", is_streaming);
+    tracing::debug!(model = %client_model, streaming = is_streaming, "received request");
     metrics::request_started(is_streaming);
 
     if config.verbose {
@@ -39,6 +39,7 @@ pub async fn proxy_handler(
 
     let policy = translation_policy(&config);
     let openai_req = pipeline::translate_request(req, &policy)?;
+    let upstream_model = openai_req.model.clone();
 
     if config.verbose {
         tracing::trace!(
@@ -58,6 +59,20 @@ pub async fn proxy_handler(
         Err(err) => err.status_code().as_u16(),
     };
     metrics::request_finished(start, status, is_streaming);
+
+    // One line per request; failures log at WARN (visible at the default level)
+    // with the upstream's error message so production issues are diagnosable.
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    match &result {
+        Ok(_) => tracing::debug!(
+            model = %client_model, upstream = %upstream_model,
+            status, elapsed_ms, streaming = is_streaming, "request completed"
+        ),
+        Err(err) => tracing::warn!(
+            model = %client_model, upstream = %upstream_model,
+            status, elapsed_ms, streaming = is_streaming, "request failed: {err}"
+        ),
+    }
 
     result
 }
@@ -277,22 +292,21 @@ async fn handle_non_streaming(
                     retriable,
                 } => {
                     metrics::upstream_error("chat_completions");
-                    let err = ProxyError::UpstreamStatus { status, message };
                     if retriable {
                         tracing::warn!(
-                            "Upstream {} attempt {}/{} returned {}",
-                            url,
-                            attempt,
-                            MAX_ATTEMPTS,
-                            status
+                            "upstream {url} attempt {attempt}/{MAX_ATTEMPTS} returned {status}: {message}"
                         );
-                        last_err = Some(err);
+                        last_err = Some(ProxyError::UpstreamStatus { status, message });
                         continue;
                     }
                     // 4xx is deterministic — surface the real status instead of masking as 502.
+                    tracing::warn!("upstream {url} returned {status} (non-retriable): {message}");
+                    return Err(ProxyError::UpstreamStatus { status, message });
+                }
+                SendOutcome::Fatal(err) => {
+                    tracing::warn!("upstream {url} fatal transport error: {err}");
                     return Err(err);
                 }
-                SendOutcome::Fatal(err) => return Err(err),
             };
 
             // Read the body explicitly so a mid-body transport drop is retried
@@ -408,22 +422,21 @@ async fn handle_streaming(
                     retriable,
                 } => {
                     metrics::upstream_error("chat_completions");
-                    let err = ProxyError::UpstreamStatus { status, message };
                     if retriable {
                         tracing::warn!(
-                            "Upstream {} attempt {}/{} returned {}",
-                            url,
-                            attempt,
-                            MAX_ATTEMPTS,
-                            status
+                            "upstream {url} attempt {attempt}/{MAX_ATTEMPTS} returned {status}: {message}"
                         );
-                        last_err = Some(err);
+                        last_err = Some(ProxyError::UpstreamStatus { status, message });
                         continue;
                     }
                     // 4xx is deterministic — surface the real status instead of masking as 502.
+                    tracing::warn!("upstream {url} returned {status} (non-retriable): {message}");
+                    return Err(ProxyError::UpstreamStatus { status, message });
+                }
+                SendOutcome::Fatal(err) => {
+                    tracing::warn!("upstream {url} fatal transport error: {err}");
                     return Err(err);
                 }
-                SendOutcome::Fatal(err) => return Err(err),
             };
 
             let upstream = response.bytes_stream();
