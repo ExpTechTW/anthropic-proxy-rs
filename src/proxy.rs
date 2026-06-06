@@ -91,8 +91,12 @@ fn request_fields_summary(req: &anthropic::AnthropicRequest) -> String {
     if let Some(obj) = value.as_object_mut() {
         // Replace each bulky field with a count so the line stays small but we can still see
         // how much was sent. `system` may be a string or an array of blocks.
-        let messages = obj.remove("messages").map_or(0, |m| m.as_array().map_or(0, Vec::len));
-        let tools = obj.remove("tools").map_or(0, |t| t.as_array().map_or(0, Vec::len));
+        let messages = obj
+            .remove("messages")
+            .map_or(0, |m| m.as_array().map_or(0, Vec::len));
+        let tools = obj
+            .remove("tools")
+            .map_or(0, |t| t.as_array().map_or(0, Vec::len));
         let system = match obj.remove("system") {
             Some(serde_json::Value::Array(a)) => a.len(),
             Some(serde_json::Value::String(_)) => 1,
