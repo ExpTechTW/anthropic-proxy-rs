@@ -37,6 +37,10 @@ pub struct OpenAIRequest {
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// OpenAI-standard reasoning effort level (`low`/`medium`/`high`/…). The upstream (or a
+    /// gateway) interprets it; unknown levels are the upstream's concern, not ours.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

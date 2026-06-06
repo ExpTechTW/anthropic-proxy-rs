@@ -409,6 +409,7 @@ fn translation_policy(config: &Config) -> pipeline::TranslationPolicy {
         reasoning_model: config.reasoning_model.clone(),
         completion_model: config.completion_model.clone(),
         model_map: config.model_map.clone(),
+        effort_map: config.effort_map.clone(),
         ignore_terms: config.system_prompt_ignore_terms.clone(),
     }
 }

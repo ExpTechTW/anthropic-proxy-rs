@@ -192,6 +192,7 @@ anthropic-proxy --help
 | `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS` | 否 | – | 轉發前要移除的 system prompt 詞彙(`;` 或換行分隔) |
 | `ANTHROPIC_PROXY_MODEL_MAP` | 否 | – | 上游呼叫前的精確模型對映(`source=target;other=target`) |
 | `ANTHROPIC_PROXY_UPSTREAM_TOKENIZE` | 否 | `false` | 用上游 vLLM 風格的 `/tokenize` 取得**精確**的 `count_tokens` 與準確的溢出夾值,而非本地估算 |
+| `ANTHROPIC_PROXY_EFFORT_MAP` | 否 | – | 把 Anthropic thinking 對映成 OpenAI 的 `reasoning_effort` 欄位(見下方) |
 | `REASONING_MODEL` | 否 | (請求模型) | 啟用延伸思考時使用的模型\*\* |
 | `COMPLETION_MODEL` | 否 | (請求模型) | 一般請求(無思考)使用的模型\*\* |
 | `DEBUG` | 否 | `false` | 除錯日誌(`1` 或 `true`) |
@@ -204,6 +205,19 @@ anthropic-proxy --help
 - 服務基底 URL:`https://api.openai.com` → `/v1/chat/completions`
 - 帶版本的基底 URL:`https://gateway.company.internal/v2` → `/v2/chat/completions`
 - 完整端點:`https://gateway.company.internal/v2/chat/completions` → 原樣使用
+
+### Reasoning effort(思考強度)
+
+`ANTHROPIC_PROXY_EFFORT_MAP` 會依客戶端的 thinking 請求,對上游送出 OpenAI 的 `reasoning_effort` 欄位(相容的 gateway 會把等級解析成每模型的 thinking budget) —— 一組全域門檻,加上可選的 per-(client-)model 覆寫,每個 tier 是 `effort:maxBudget`:
+
+```bash
+ANTHROPIC_PROXY_EFFORT_MAP="low:2048,medium:8192,high:16384;claude-haiku-3-5=low:512,high:16384"
+```
+
+- 客戶端的 `thinking.budget_tokens`(夾到 **16384**)會選「第一個 `maxBudget ≥ budget` 的 tier」;全部超過 → 取最高 tier。
+- `;` 分段中**沒有** `=` 的是全域預設;`model=tiers` 覆寫單一 client 模型。
+- 客戶端若直接帶 Anthropic `effort` 欄位則原樣轉送。等級一律原樣傳出 —— 驗證與「未知/空值的預設」交給上游處理(相容的 gateway 會預設成 `medium`)。
+- 只列上游接受的 tier(例如 qwen 吃 `low`/`medium`/`high`;若不支援 `xhigh`/`max` 會 `400`)。未設定時不送 `effort`。
 
 ### 設定檔搜尋順序
 

@@ -160,6 +160,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             .join("; ");
         tracing::info!("Model map: {}", entries);
     }
+    if !config.effort_map.is_empty() {
+        tracing::info!("Effort map: thinking budget -> effort level enabled");
+    }
 
     let metrics_handle = metrics::install();
 

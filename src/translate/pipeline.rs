@@ -1,3 +1,4 @@
+use crate::config::EffortMap;
 use crate::error::{ProxyError, ProxyResult};
 use crate::models::{anthropic, openai};
 use crate::translate::core;
@@ -8,6 +9,7 @@ pub struct TranslationPolicy {
     pub reasoning_model: Option<String>,
     pub completion_model: Option<String>,
     pub model_map: BTreeMap<String, String>,
+    pub effort_map: EffortMap,
     pub ignore_terms: Vec<String>,
 }
 
@@ -16,6 +18,7 @@ pub fn translate_request(
     policy: &TranslationPolicy,
 ) -> ProxyResult<openai::OpenAIRequest> {
     let model = select_model(&req, policy);
+    let reasoning_effort = resolve_effort(&req, &policy.effort_map);
 
     let mut openai_messages = Vec::new();
 
@@ -81,7 +84,40 @@ pub fn translate_request(
         tool_choice,
         parallel_tool_calls,
         user,
+        reasoning_effort,
     })
+}
+
+/// Derive the upstream `reasoning_effort` from an Anthropic request:
+/// 1. **`output_config.effort`** — what current models (Opus 4.6+/Sonnet 4.6+) actually send;
+///    forwarded as-is (also tolerates a bare top-level `effort`), or
+/// 2. legacy `thinking.budget_tokens` (Opus 4.5 and older) mapped through the [`EffortMap`].
+///
+/// The level is passed through verbatim — validating it (and defaulting unknown/empty levels)
+/// is the upstream's job. Returns `None` when the client gives neither, or no effort tiers are
+/// configured for the budget path — so behaviour is unchanged unless effort is in play.
+fn resolve_effort(req: &anthropic::AnthropicRequest, effort_map: &EffortMap) -> Option<String> {
+    // Current models put it at output_config.effort; tolerate a bare top-level effort too.
+    let effort = req
+        .extra
+        .get("output_config")
+        .and_then(|cfg| cfg.get("effort"))
+        .or_else(|| req.extra.get("effort"))
+        .and_then(Value::as_str);
+    if let Some(effort) = effort {
+        return Some(effort.trim().to_ascii_lowercase());
+    }
+
+    // Legacy fixed-budget thinking → bucket the budget into a level.
+    let thinking = req.extra.get("thinking").and_then(Value::as_object)?;
+    if thinking.get("type").and_then(Value::as_str) != Some("enabled") {
+        return None;
+    }
+    let budget = thinking
+        .get("budget_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    effort_map.resolve(&req.model, budget)
 }
 
 /// Extract `metadata.user_id` (the only metadata field with an OpenAI equivalent).
@@ -438,6 +474,7 @@ mod tests {
             reasoning_model: config.reasoning_model.clone(),
             completion_model: config.completion_model.clone(),
             model_map: config.model_map.clone(),
+            effort_map: config.effort_map.clone(),
             ignore_terms: config.system_prompt_ignore_terms.clone(),
         }
     }
@@ -845,6 +882,136 @@ mod tests {
 
         let openai = translate_request(req, &policy).unwrap();
         assert_eq!(openai.model, "gpt-4o-reasoning");
+    }
+
+    #[test]
+    fn thinking_budget_sets_reasoning_effort() {
+        let make = |budget: u64| anthropic::AnthropicRequest {
+            model: "claude-opus-4-7".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            extra: json!({"thinking": {"type": "enabled", "budget_tokens": budget}}),
+        };
+        let policy = TranslationPolicy {
+            effort_map: EffortMap::parse("low:2048,medium:8192,high:16384"),
+            ..default_policy()
+        };
+
+        assert_eq!(
+            translate_request(make(5000), &policy)
+                .unwrap()
+                .reasoning_effort,
+            Some("medium".to_string())
+        );
+        // ultrathink (31999) clamps to 16384 → top tier.
+        assert_eq!(
+            translate_request(make(31999), &policy)
+                .unwrap()
+                .reasoning_effort,
+            Some("high".to_string())
+        );
+    }
+
+    #[test]
+    fn no_effort_without_thinking_or_map() {
+        let req = anthropic::AnthropicRequest {
+            model: "claude-opus-4-7".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            extra: json!({"thinking": {"type": "enabled", "budget_tokens": 5000}}),
+        };
+        // Default policy has an empty effort map → no reasoning_effort emitted.
+        assert_eq!(
+            translate_request(req, &default_policy())
+                .unwrap()
+                .reasoning_effort,
+            None
+        );
+    }
+
+    #[test]
+    fn direct_effort_field_passes_through_normalized() {
+        let req = anthropic::AnthropicRequest {
+            model: "claude-opus-4-8".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            extra: json!({
+                "output_config": {"effort": "XHigh"},
+                "thinking": {"type": "adaptive"}
+            }),
+        };
+        // output_config.effort (what current models send) is forwarded, normalized,
+        // even with no effort map configured and adaptive thinking instead of a budget.
+        assert_eq!(
+            translate_request(req, &default_policy())
+                .unwrap()
+                .reasoning_effort,
+            Some("xhigh".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_top_level_effort_is_tolerated() {
+        let req = anthropic::AnthropicRequest {
+            model: "claude-opus-4-8".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: 100,
+            system: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            tool_choice: None,
+            extra: json!({"effort": "low"}),
+        };
+        assert_eq!(
+            translate_request(req, &default_policy())
+                .unwrap()
+                .reasoning_effort,
+            Some("low".to_string())
+        );
     }
 
     #[test]

@@ -192,6 +192,7 @@ Set via environment or a `.env` file:
 | `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS` | No | – | System-prompt terms to remove before forwarding (`;` or newline separated) |
 | `ANTHROPIC_PROXY_MODEL_MAP` | No | – | Exact model remapping before the upstream call (`source=target;other=target`) |
 | `ANTHROPIC_PROXY_UPSTREAM_TOKENIZE` | No | `false` | Use the upstream's vLLM-style `/tokenize` for **exact** `count_tokens` and accurate overflow clamping, instead of a local estimate |
+| `ANTHROPIC_PROXY_EFFORT_MAP` | No | – | Map Anthropic thinking → the OpenAI `reasoning_effort` field (see below) |
 | `REASONING_MODEL` | No | (request model) | Model used when extended thinking is enabled\*\* |
 | `COMPLETION_MODEL` | No | (request model) | Model used for standard requests (no thinking)\*\* |
 | `DEBUG` | No | `false` | Debug logging (`1` or `true`) |
@@ -204,6 +205,19 @@ Set via environment or a `.env` file:
 - Service base URL: `https://api.openai.com` → `/v1/chat/completions`
 - Versioned base URL: `https://gateway.company.internal/v2` → `/v2/chat/completions`
 - Full endpoint: `https://gateway.company.internal/v2/chat/completions` → used as-is
+
+### Reasoning effort
+
+`ANTHROPIC_PROXY_EFFORT_MAP` forwards the OpenAI `reasoning_effort` field to the upstream (a compatible gateway resolves the level to a per-model thinking budget), derived from the client's thinking request — global tiers plus optional per-(client-)model overrides, each tier `effort:maxBudget`:
+
+```bash
+ANTHROPIC_PROXY_EFFORT_MAP="low:2048,medium:8192,high:16384;claude-haiku-3-5=low:512,high:16384"
+```
+
+- The client's `thinking.budget_tokens` (clamped to **16384**) selects the first tier whose `maxBudget ≥ budget`; above them all → the highest tier.
+- A `;`-segment **without** `=` is the global default; `model=tiers` overrides one client model.
+- A direct Anthropic `effort` field is forwarded as-is. The level is passed through verbatim — validating it and defaulting unknown/empty levels is the upstream's job (a compatible gateway defaults them to `medium`).
+- List only tiers your upstream accepts (e.g. qwen takes `low`/`medium`/`high`; `xhigh`/`max` would `400` if unsupported). When unset, no `effort` is sent.
 
 ### Configuration file locations
 
