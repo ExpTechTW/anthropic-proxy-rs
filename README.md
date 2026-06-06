@@ -119,44 +119,34 @@ docker build -f Dockerfile.source -t anthropic-proxy .
 ## Use with Claude Code
 
 ```bash
-# Start the proxy as a daemon and launch Claude Code against it
 anthropic-proxy --daemon && ANTHROPIC_BASE_URL=http://localhost:3000 claude
-
-# Or in separate terminals:
-anthropic-proxy                                   # terminal 1
-ANTHROPIC_BASE_URL=http://localhost:3000 claude   # terminal 2
 ```
 
-### Recommended `settings.json`
+### Recommended settings — [`examples/claude-code-settings.json`](examples/claude-code-settings.json)
 
-When your upstream model's context window is **smaller** than the Claude model name implies (e.g. a 105 K-token backend mapped to `claude-sonnet-4-5`, which Claude Code assumes is 200 K/1 M), Claude Code won't auto-compact until *far* past the real limit — and every request then fails with `context length exceeded`. Tell it the real window:
+Copy it into `~/.claude/settings.json` (or a project-level `.claude/settings.json`) and fill in your proxy URL and key. The one setting that really matters:
 
-Copy [`examples/claude-code-settings.json`](examples/claude-code-settings.json) into your Claude Code settings (`~/.claude/settings.json`, or a project-level `.claude/settings.json`):
+**`CLAUDE_CODE_AUTO_COMPACT_WINDOW`** — set it to your upstream model's **real** context window in tokens (e.g. `105120`). When a smaller backend is mapped to a name like `claude-sonnet-4-5`, Claude Code otherwise assumes that model's full 200K/1M window and won't auto-compact until *far* past the real limit — so requests eventually fail with `context length exceeded`.
 
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "https://your-proxy.example.com",
-    "ANTHROPIC_AUTH_TOKEN": "<your-upstream-api-key>",
-    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "105120",
-    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"
-  },
-  "model": "claude-sonnet-4-5"
-}
-```
-
-| Key | Why it matters |
-|-----|----------------|
-| `ANTHROPIC_BASE_URL` | Your proxy's URL. |
-| `ANTHROPIC_AUTH_TOKEN` | Sent as `x-api-key`; becomes the upstream key when the proxy runs in passthrough mode. |
-| **`CLAUDE_CODE_AUTO_COMPACT_WINDOW`** | **Set to the upstream model's real context window** (in tokens). This is the value auto-compaction is calculated against — without it, Claude Code uses the model-name default and compacts too late. |
-| **`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`** | Compact at this % of the window (default is ~95 %). `75` leaves comfortable headroom for the response. |
-
-> ⚠️ **Do not use `CLAUDE_CODE_MAX_CONTEXT_TOKENS` for this** — per the [Claude Code docs](https://code.claude.com/docs/en/env-vars) it only takes effect together with `DISABLE_COMPACT`. The variable that actually drives auto-compaction is `CLAUDE_CODE_AUTO_COMPACT_WINDOW`.
+> ⚠️ **Not `CLAUDE_CODE_MAX_CONTEXT_TOKENS`** — per the [docs](https://code.claude.com/docs/en/env-vars) it only applies together with `DISABLE_COMPACT`. `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is the one that drives auto-compaction.
 >
-> If `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` appears to be ignored from `settings.json`, set it as a shell environment variable instead ([known issue](https://github.com/anthropics/claude-code/issues/63186)).
+> **No `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` needed** — Claude Code reserves a fixed ~33K-token buffer, so a smaller window already compacts with headroom (~68% of 105K). That override only compacts *earlier* (it's ignored above the default), so it can't delay compaction.
 
-Verify with `/context` — it should report your real window (e.g. `30.6k / 105.1k`) and an `Auto-compact window` line.
+Verify with `/context`: it should show your real window (e.g. `30.6k / 105.1k`) and an `Auto-compact window` line.
+
+### Status line — [`examples/statusline.sh`](examples/statusline.sh)
+
+A companion status line showing the **real** context fill (matching `/context`, not Claude Code's full-window `used_percentage`) and a running session cost:
+
+```text
+Sonnet 4.5 │ ctx ━━━━━┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄ 29% 105k │ NT$6.38
+```
+
+The cost is summed from the session transcript, so it follows the session — delete the session and it's gone, no orphaned state file. Install (needs `jq`), then set your gateway's rates near the top of the script:
+
+```bash
+cp examples/statusline.sh ~/.claude/statusline.sh && chmod +x ~/.claude/statusline.sh
+```
 
 ## Configuration
 
@@ -202,6 +192,7 @@ Set via environment or a `.env` file:
 | `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS` | No | – | System-prompt terms to remove before forwarding (`;` or newline separated) |
 | `ANTHROPIC_PROXY_MODEL_MAP` | No | – | Exact model remapping before the upstream call (`source=target;other=target`) |
 | `ANTHROPIC_PROXY_UPSTREAM_TOKENIZE` | No | `false` | Use the upstream's vLLM-style `/tokenize` for **exact** `count_tokens` and accurate overflow clamping, instead of a local estimate |
+| `ANTHROPIC_PROXY_EFFORT_MAP` | No | – | Map Anthropic thinking → the OpenAI `reasoning_effort` field (see below) |
 | `REASONING_MODEL` | No | (request model) | Model used when extended thinking is enabled\*\* |
 | `COMPLETION_MODEL` | No | (request model) | Model used for standard requests (no thinking)\*\* |
 | `DEBUG` | No | `false` | Debug logging (`1` or `true`) |
@@ -214,6 +205,19 @@ Set via environment or a `.env` file:
 - Service base URL: `https://api.openai.com` → `/v1/chat/completions`
 - Versioned base URL: `https://gateway.company.internal/v2` → `/v2/chat/completions`
 - Full endpoint: `https://gateway.company.internal/v2/chat/completions` → used as-is
+
+### Reasoning effort
+
+`ANTHROPIC_PROXY_EFFORT_MAP` forwards the OpenAI `reasoning_effort` field to the upstream (a compatible gateway resolves the level to a per-model thinking budget), derived from the client's thinking request — global tiers plus optional per-(client-)model overrides, each tier `effort:maxBudget`:
+
+```bash
+ANTHROPIC_PROXY_EFFORT_MAP="low:2048,medium:8192,high:16384;claude-haiku-3-5=low:512,high:16384"
+```
+
+- The client's `thinking.budget_tokens` (clamped to **16384**) selects the first tier whose `maxBudget ≥ budget`; above them all → the highest tier.
+- A `;`-segment **without** `=` is the global default; `model=tiers` overrides one client model.
+- A direct Anthropic `effort` field is forwarded as-is. The level is passed through verbatim — validating it and defaulting unknown/empty levels is the upstream's job (a compatible gateway defaults them to `medium`).
+- List only tiers your upstream accepts (e.g. qwen takes `low`/`medium`/`high`; `xhigh`/`max` would `400` if unsupported). When unset, no `effort` is sent.
 
 ### Configuration file locations
 

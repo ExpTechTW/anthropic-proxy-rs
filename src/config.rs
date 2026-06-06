@@ -12,11 +12,16 @@ pub struct Config {
     /// Forward count_tokens to the upstream `/tokenize` for exact counts (opt-in).
     pub upstream_tokenize: bool,
     pub model_map: BTreeMap<String, String>,
+    /// Maps a thinking budget to an upstream `reasoning_effort` (global tiers + per-model overrides).
+    pub effort_map: EffortMap,
     pub system_prompt_ignore_terms: Vec<String>,
     pub reasoning_model: Option<String>,
     pub completion_model: Option<String>,
     pub debug: bool,
     pub verbose: bool,
+    /// Log every request's fields (minus `messages`/`system`) at INFO, so new/unknown
+    /// client fields are visible for debugging without dumping message bodies.
+    pub log_requests: bool,
 }
 
 impl Default for Config {
@@ -29,13 +34,93 @@ impl Default for Config {
             passthrough_api_key: false,
             upstream_tokenize: false,
             model_map: BTreeMap::new(),
+            effort_map: EffortMap::default(),
             system_prompt_ignore_terms: Vec::new(),
             reasoning_model: None,
             completion_model: None,
             debug: false,
             verbose: false,
+            log_requests: false,
         }
     }
+}
+
+/// Upper bound on the thinking budget we map (matches a typical 16K max output).
+const MAX_THINKING_BUDGET: u32 = 16384;
+
+/// Maps a thinking `budget_tokens` to an upstream `reasoning_effort`: a global tier list plus
+/// optional per-(client-)model overrides.
+#[derive(Debug, Clone, Default)]
+pub struct EffortMap {
+    /// (max_budget, effort) sorted ascending — used for models without an override.
+    global: Vec<(u32, String)>,
+    /// Per-model tier lists (keyed on the client model name).
+    overrides: BTreeMap<String, Vec<(u32, String)>>,
+}
+
+impl EffortMap {
+    /// Parse `"low:2048,medium:8192,high:16384;claude-haiku-3-5=low:512,medium:4096,high:16384"`.
+    /// A `;`-segment without `=` sets the **global** tiers; `model=tiers` segments **override**
+    /// a specific client model. Each tier is `effort:maxBudget`; tiers are sorted by budget.
+    pub fn parse(spec: &str) -> Self {
+        let mut map = EffortMap::default();
+        for segment in spec.split(';') {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            match segment.split_once('=') {
+                Some((model, tiers)) => {
+                    let tiers = parse_tiers(tiers);
+                    if !tiers.is_empty() {
+                        map.overrides.insert(model.trim().to_string(), tiers);
+                    }
+                }
+                None => {
+                    let tiers = parse_tiers(segment);
+                    if !tiers.is_empty() {
+                        map.global = tiers;
+                    }
+                }
+            }
+        }
+        map
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.global.is_empty() && self.overrides.is_empty()
+    }
+
+    /// Resolve a `reasoning_effort` for `model` and a thinking `budget` (tokens), or `None`
+    /// when no tiers apply. The budget is clamped to [`MAX_THINKING_BUDGET`]; the chosen tier
+    /// is the first whose `maxBudget >= budget`, or the highest tier when it exceeds them all.
+    pub fn resolve(&self, model: &str, budget: u32) -> Option<String> {
+        let tiers = match self.overrides.get(model) {
+            Some(tiers) if !tiers.is_empty() => tiers,
+            _ => &self.global,
+        };
+        let budget = budget.min(MAX_THINKING_BUDGET);
+        tiers
+            .iter()
+            .find(|(max_budget, _)| budget <= *max_budget)
+            .or_else(|| tiers.last())
+            .map(|(_, effort)| effort.clone())
+    }
+}
+
+/// Parse `"low:2048,medium:8192,high:16384"` into ascending `(max_budget, effort)` tiers.
+/// Effort labels are passed through as-is (lowercased) — validating them is the upstream's job.
+fn parse_tiers(spec: &str) -> Vec<(u32, String)> {
+    let mut tiers: Vec<(u32, String)> = spec
+        .split(',')
+        .filter_map(|pair| {
+            let (effort, budget) = pair.trim().split_once(':')?;
+            let budget: u32 = budget.trim().parse().ok()?;
+            Some((budget, effort.trim().to_ascii_lowercase()))
+        })
+        .collect();
+    tiers.sort_by_key(|(budget, _)| *budget);
+    tiers
 }
 
 impl Config {
@@ -113,6 +198,11 @@ impl Config {
             .transpose()?
             .unwrap_or_default();
 
+        let effort_map = env::var("ANTHROPIC_PROXY_EFFORT_MAP")
+            .ok()
+            .map(|value| EffortMap::parse(&value))
+            .unwrap_or_default();
+
         let mut system_prompt_ignore_terms = env::var("ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS")
             .ok()
             .map(|value| Self::parse_system_prompt_ignore_terms(&value))
@@ -131,6 +221,10 @@ impl Config {
             .unwrap_or(false);
 
         let passthrough_api_key = env::var("UPSTREAM_API_KEY_PASSTHROUGH")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+
+        let log_requests = env::var("ANTHROPIC_PROXY_LOG_REQUESTS")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
 
@@ -155,11 +249,13 @@ impl Config {
             passthrough_api_key,
             upstream_tokenize,
             model_map,
+            effort_map,
             system_prompt_ignore_terms,
             reasoning_model,
             completion_model,
             debug,
             verbose,
+            log_requests,
         })
     }
 
@@ -360,7 +456,44 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, EffortMap};
+
+    #[test]
+    fn effort_map_global_tiers_pick_by_budget() {
+        let map = EffortMap::parse("low:2048,medium:8192,high:16384");
+        assert_eq!(map.resolve("any", 500).as_deref(), Some("low"));
+        assert_eq!(map.resolve("any", 2048).as_deref(), Some("low"));
+        assert_eq!(map.resolve("any", 4000).as_deref(), Some("medium"));
+        assert_eq!(map.resolve("any", 10000).as_deref(), Some("high"));
+        // Above the top tier (and beyond the 16K clamp) → highest tier.
+        assert_eq!(map.resolve("any", 31999).as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn effort_map_per_model_override_wins() {
+        let map =
+            EffortMap::parse("low:2048,medium:8192,high:16384;claude-haiku-3-5=low:512,high:16384");
+        // Override model: 1000 > 512 → next tier (high).
+        assert_eq!(
+            map.resolve("claude-haiku-3-5", 1000).as_deref(),
+            Some("high")
+        );
+        // Unlisted model falls back to the global tiers.
+        assert_eq!(map.resolve("claude-opus-4-7", 1000).as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn effort_map_passes_labels_through_verbatim() {
+        // Labels are forwarded as-is (lowercased); the upstream validates/defaults them.
+        let map = EffortMap::parse("ULTRA:2048,high:16384");
+        assert_eq!(map.resolve("any", 1000).as_deref(), Some("ultra"));
+    }
+
+    #[test]
+    fn effort_map_empty_when_unset() {
+        assert!(EffortMap::default().is_empty());
+        assert_eq!(EffortMap::default().resolve("any", 5000), None);
+    }
 
     #[test]
     fn base_url_without_version_defaults_to_v1_endpoint() {

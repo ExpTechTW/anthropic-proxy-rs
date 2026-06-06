@@ -30,6 +30,10 @@ pub async fn proxy_handler(
     tracing::debug!(model = %client_model, streaming = is_streaming, "received request");
     metrics::request_started(is_streaming);
 
+    if config.log_requests {
+        tracing::info!("request fields: {}", request_fields_summary(&req));
+    }
+
     if config.verbose {
         tracing::trace!(
             "Incoming Anthropic request: {}",
@@ -75,6 +79,34 @@ pub async fn proxy_handler(
     }
 
     result
+}
+
+/// Serialize a request to a compact JSON object with the bulky content blocks (`messages`,
+/// `system`, `tools`) replaced by `*_count` breadcrumbs, keeping every other field (including
+/// unknown ones flattened into `extra`). Used by the `ANTHROPIC_PROXY_LOG_REQUESTS` debug log
+/// so newly-introduced client fields (e.g. `output_config.effort`) are visible per-request
+/// without dumping conversation content — keeping each log line small.
+fn request_fields_summary(req: &anthropic::AnthropicRequest) -> String {
+    let mut value = serde_json::to_value(req).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = value.as_object_mut() {
+        // Replace each bulky field with a count so the line stays small but we can still see
+        // how much was sent. `system` may be a string or an array of blocks.
+        let messages = obj
+            .remove("messages")
+            .map_or(0, |m| m.as_array().map_or(0, Vec::len));
+        let tools = obj
+            .remove("tools")
+            .map_or(0, |t| t.as_array().map_or(0, Vec::len));
+        let system = match obj.remove("system") {
+            Some(serde_json::Value::Array(a)) => a.len(),
+            Some(serde_json::Value::String(_)) => 1,
+            _ => 0,
+        };
+        obj.insert("messages_count".to_string(), messages.into());
+        obj.insert("tools_count".to_string(), tools.into());
+        obj.insert("system_blocks".to_string(), system.into());
+    }
+    serde_json::to_string(&value).unwrap_or_default()
 }
 
 /// `POST /v1/messages/count_tokens` — Claude Code calls this for context budgeting.
@@ -409,6 +441,7 @@ fn translation_policy(config: &Config) -> pipeline::TranslationPolicy {
         reasoning_model: config.reasoning_model.clone(),
         completion_model: config.completion_model.clone(),
         model_map: config.model_map.clone(),
+        effort_map: config.effort_map.clone(),
         ignore_terms: config.system_prompt_ignore_terms.clone(),
     }
 }
@@ -849,11 +882,41 @@ fn create_sse_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::create_sse_stream;
+    use super::{create_sse_stream, request_fields_summary};
+    use crate::models::anthropic;
     use bytes::Bytes;
     use futures::stream::{self, StreamExt};
     use serde_json::{json, Value};
     use std::fmt;
+
+    #[test]
+    fn request_fields_summary_strips_content_keeps_unknown_fields() {
+        let req: anthropic::AnthropicRequest = serde_json::from_value(json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 4096,
+            "system": "you are helpful",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"}
+            ],
+            "tools": [{"name": "Bash", "input_schema": {}}],
+            // an unknown/new field we want to surface for debugging
+            "output_config": {"effort": "xhigh"}
+        }))
+        .unwrap();
+
+        let summary: Value = serde_json::from_str(&request_fields_summary(&req)).unwrap();
+        // Bulky content replaced by counts.
+        assert!(summary.get("messages").is_none());
+        assert!(summary.get("system").is_none());
+        assert!(summary.get("tools").is_none());
+        assert_eq!(summary["messages_count"], json!(2));
+        assert_eq!(summary["tools_count"], json!(1));
+        assert_eq!(summary["system_blocks"], json!(1));
+        // Control + unknown fields survive for debugging.
+        assert_eq!(summary["model"], json!("claude-opus-4-8"));
+        assert_eq!(summary["output_config"]["effort"], json!("xhigh"));
+    }
 
     #[derive(Debug)]
     struct TestError;
