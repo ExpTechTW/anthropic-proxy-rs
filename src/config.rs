@@ -19,6 +19,9 @@ pub struct Config {
     pub completion_model: Option<String>,
     pub debug: bool,
     pub verbose: bool,
+    /// Log every request's fields (minus `messages`/`system`) at INFO, so new/unknown
+    /// client fields are visible for debugging without dumping message bodies.
+    pub log_requests: bool,
 }
 
 impl Default for Config {
@@ -37,6 +40,7 @@ impl Default for Config {
             completion_model: None,
             debug: false,
             verbose: false,
+            log_requests: false,
         }
     }
 }
@@ -220,6 +224,10 @@ impl Config {
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
 
+        let log_requests = env::var("ANTHROPIC_PROXY_LOG_REQUESTS")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         let upstream_tokenize = env::var("ANTHROPIC_PROXY_UPSTREAM_TOKENIZE")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
@@ -247,6 +255,7 @@ impl Config {
             completion_model,
             debug,
             verbose,
+            log_requests,
         })
     }
 

@@ -163,6 +163,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     if !config.effort_map.is_empty() {
         tracing::info!("Effort map: thinking budget -> effort level enabled");
     }
+    if config.log_requests {
+        tracing::info!("Request logging: per-request fields (minus messages/system) enabled");
+    }
 
     let metrics_handle = metrics::install();
 
