@@ -22,6 +22,10 @@ pub struct Config {
     /// Log every request's fields (minus `messages`/`system`) at INFO, so new/unknown
     /// client fields are visible for debugging without dumping message bodies.
     pub log_requests: bool,
+    /// Seconds of streaming-output silence before emitting an SSE keep-alive comment,
+    /// so a fronting proxy (e.g. Cloudflare's free plan, 100s) doesn't abort the stream
+    /// during the gap before the first token. 0 disables the heartbeat.
+    pub heartbeat_secs: u64,
 }
 
 impl Default for Config {
@@ -41,6 +45,7 @@ impl Default for Config {
             debug: false,
             verbose: false,
             log_requests: false,
+            heartbeat_secs: 15,
         }
     }
 }
@@ -232,6 +237,11 @@ impl Config {
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
 
+        let heartbeat_secs = env::var("ANTHROPIC_PROXY_HEARTBEAT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15);
+
         // Validate: UPSTREAM_API_KEY_PASSTHROUGH requires UPSTREAM_API_KEY to be unset
         if passthrough_api_key && api_key.is_some() {
             bail!(
@@ -256,6 +266,7 @@ impl Config {
             debug,
             verbose,
             log_requests,
+            heartbeat_secs,
         })
     }
 

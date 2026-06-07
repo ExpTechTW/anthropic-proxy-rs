@@ -778,7 +778,12 @@ async fn handle_streaming(
 
             let upstream = response.bytes_stream();
             let input_estimate = pipeline::estimate_openai_input_tokens(&openai_req);
-            let sse_stream = create_sse_stream(upstream, openai_req.model.clone(), input_estimate);
+            let sse_stream = create_sse_stream(
+                upstream,
+                openai_req.model.clone(),
+                input_estimate,
+                Duration::from_secs(config.heartbeat_secs),
+            );
 
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -821,53 +826,91 @@ fn create_sse_stream(
         + 'static,
     fallback_model: String,
     input_estimate: u32,
+    heartbeat: Duration,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    // Heartbeat: emit an SSE comment (": keep-alive\n\n") after `heartbeat` of output
+    // silence so a fronting proxy (Cloudflare free plan: 100s with no bytes → 524)
+    // doesn't abort the response during the gap before the first token (the gateway's
+    // queueing + prefill + initial thinking can exceed 100s).
+    //
+    // The timer is driven independently of upstream reads and reset only when we yield a
+    // REAL event — deliberately. The Go gateway in front sends its OWN ": keep-alive"
+    // comments, which this parser silently drops (see the heartbeat_comments test); if we
+    // keyed the timer off upstream activity, those comments would keep resetting it and we
+    // would never emit to our own client — 524ing anyway. Resetting only on real output
+    // means a heartbeat fires whenever the *client* has gone quiet, regardless of upstream
+    // chatter. A comment is transport-level (ignored by every SSE/Anthropic client) and is
+    // only ever yielded between complete frames, so it can never corrupt an event.
+    let period = if heartbeat.is_zero() {
+        Duration::from_secs(60 * 60 * 24 * 365) // disabled → effectively never fires
+    } else {
+        heartbeat
+    };
     async_stream::stream! {
         let mut buffer = String::new();
         let mut state = stream::initial_state(fallback_model, input_estimate);
 
         tokio::pin!(upstream);
 
-        while let Some(chunk) = upstream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    buffer.push_str(&text);
+        let mut beat = tokio::time::interval(period);
+        beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        beat.tick().await; // consume the immediate first tick → first beat is one period out
 
-                    while let Some((pos, sep_len)) = find_frame_boundary(&buffer) {
-                        let line = buffer[..pos].to_string();
-                        buffer = buffer[pos + sep_len..].to_string();
+        loop {
+            tokio::select! {
+                maybe_chunk = upstream.next() => {
+                    let Some(chunk) = maybe_chunk else { break };
+                    match chunk {
+                        Ok(bytes) => {
+                            let mut yielded = false;
+                            let text = String::from_utf8_lossy(&bytes);
+                            buffer.push_str(&text);
 
-                        if line.trim().is_empty() {
-                            continue;
-                        }
+                            while let Some((pos, sep_len)) = find_frame_boundary(&buffer) {
+                                let line = buffer[..pos].to_string();
+                                buffer = buffer[pos + sep_len..].to_string();
 
-                        for l in line.lines() {
-                            if let Some(data) = l.strip_prefix("data: ") {
-                                if data.trim() == "[DONE]" {
-                                    for event in stream::translate_done(&mut state) {
-                                        yield Ok(Bytes::from(serialize_event(&event)));
-                                    }
+                                if line.trim().is_empty() {
                                     continue;
                                 }
 
-                                if let Ok(chunk) = serde_json::from_str::<openai::StreamChunk>(data) {
-                                    for event in stream::translate_chunk(&mut state, &chunk) {
-                                        yield Ok(Bytes::from(serialize_event(&event)));
+                                for l in line.lines() {
+                                    if let Some(data) = l.strip_prefix("data: ") {
+                                        if data.trim() == "[DONE]" {
+                                            for event in stream::translate_done(&mut state) {
+                                                yielded = true;
+                                                yield Ok(Bytes::from(serialize_event(&event)));
+                                            }
+                                            continue;
+                                        }
+
+                                        if let Ok(chunk) = serde_json::from_str::<openai::StreamChunk>(data) {
+                                            for event in stream::translate_chunk(&mut state, &chunk) {
+                                                yielded = true;
+                                                yield Ok(Bytes::from(serialize_event(&event)));
+                                            }
+                                        } else {
+                                            tracing::debug!("Ignoring unrecognized upstream stream chunk: {}", data);
+                                        }
                                     }
-                                } else {
-                                    tracing::debug!("Ignoring unrecognized upstream stream chunk: {}", data);
                                 }
                             }
+
+                            if yielded {
+                                beat.reset(); // real output flowed → restart the idle timer
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Stream error: {}", e);
+                            for event in stream::translate_error(format!("Stream error: {}", e)) {
+                                yield Ok(Bytes::from(serialize_event(&event)));
+                            }
+                            break;
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::error!("Stream error: {}", e);
-                    for event in stream::translate_error(format!("Stream error: {}", e)) {
-                        yield Ok(Bytes::from(serialize_event(&event)));
-                    }
-                    break;
+                _ = beat.tick() => {
+                    yield Ok(Bytes::from_static(b": keep-alive\n\n"));
                 }
             }
         }
@@ -1013,7 +1056,7 @@ mod tests {
 
     async fn collect_events(chunks: Vec<String>, model: &str) -> Vec<Value> {
         let s = make_stream(chunks);
-        let sse = create_sse_stream(s, model.to_string(), 0);
+        let sse = create_sse_stream(s, model.to_string(), 0, std::time::Duration::from_secs(3600));
         tokio::pin!(sse);
 
         let mut events = Vec::new();
@@ -1292,7 +1335,7 @@ mod tests {
             Err(TestError),
         ];
         let s = stream::iter(items);
-        let sse = create_sse_stream(s, "fallback".to_string(), 0);
+        let sse = create_sse_stream(s, "fallback".to_string(), 0, std::time::Duration::from_secs(3600));
         tokio::pin!(sse);
 
         let mut events = Vec::new();
@@ -1369,6 +1412,40 @@ mod tests {
             .collect();
         assert_eq!(text_deltas.len(), 1);
         assert_eq!(text_deltas[0]["delta"]["text"], "hello");
+    }
+
+    // A backend that stalls before the first token must not leave our client silent:
+    // keep-alive comments should fill the gap, the real events should still arrive
+    // intact, and the comments must sit strictly before the first translated event.
+    #[tokio::test]
+    async fn heartbeat_fills_pre_token_gap_then_real_events_flow() {
+        use std::time::Duration;
+        let upstream = async_stream::stream! {
+            tokio::time::sleep(Duration::from_millis(200)).await; // ~6 beats at 30ms
+            yield Ok::<_, TestError>(Bytes::from(openai_chunk("c", "gpt-4o", Some("hi"), None)));
+            yield Ok(Bytes::from(openai_chunk("c", "gpt-4o", None, Some("stop"))));
+            yield Ok(Bytes::from(openai_done()));
+        };
+        let sse = create_sse_stream(upstream, "fallback".to_string(), 0, Duration::from_millis(30));
+        tokio::pin!(sse);
+
+        let mut raw = String::new();
+        while let Some(Ok(bytes)) = sse.next().await {
+            raw.push_str(&String::from_utf8_lossy(&bytes));
+        }
+
+        // Heartbeat(s) fired during the stall, and the real Anthropic events are intact.
+        assert!(raw.contains(": keep-alive\n\n"), "no heartbeat emitted: {raw:?}");
+        assert!(raw.contains("event: message_start"), "missing message_start: {raw:?}");
+        assert!(raw.contains("event: message_stop"), "missing message_stop: {raw:?}");
+
+        // Every keep-alive precedes the first real event — never spliced into a frame.
+        let first_event = raw.find("event: ").expect("an event exists");
+        let last_hb = raw.rfind(": keep-alive").expect("a heartbeat exists");
+        assert!(
+            last_hb < first_event,
+            "heartbeat appeared at/after the first event (mid-stream injection): {raw:?}"
+        );
     }
 
     #[tokio::test]
