@@ -1056,7 +1056,12 @@ mod tests {
 
     async fn collect_events(chunks: Vec<String>, model: &str) -> Vec<Value> {
         let s = make_stream(chunks);
-        let sse = create_sse_stream(s, model.to_string(), 0, std::time::Duration::from_secs(3600));
+        let sse = create_sse_stream(
+            s,
+            model.to_string(),
+            0,
+            std::time::Duration::from_secs(3600),
+        );
         tokio::pin!(sse);
 
         let mut events = Vec::new();
@@ -1335,7 +1340,12 @@ mod tests {
             Err(TestError),
         ];
         let s = stream::iter(items);
-        let sse = create_sse_stream(s, "fallback".to_string(), 0, std::time::Duration::from_secs(3600));
+        let sse = create_sse_stream(
+            s,
+            "fallback".to_string(),
+            0,
+            std::time::Duration::from_secs(3600),
+        );
         tokio::pin!(sse);
 
         let mut events = Vec::new();
@@ -1426,7 +1436,12 @@ mod tests {
             yield Ok(Bytes::from(openai_chunk("c", "gpt-4o", None, Some("stop"))));
             yield Ok(Bytes::from(openai_done()));
         };
-        let sse = create_sse_stream(upstream, "fallback".to_string(), 0, Duration::from_millis(30));
+        let sse = create_sse_stream(
+            upstream,
+            "fallback".to_string(),
+            0,
+            Duration::from_millis(30),
+        );
         tokio::pin!(sse);
 
         let mut raw = String::new();
@@ -1435,9 +1450,18 @@ mod tests {
         }
 
         // Heartbeat(s) fired during the stall, and the real Anthropic events are intact.
-        assert!(raw.contains(": keep-alive\n\n"), "no heartbeat emitted: {raw:?}");
-        assert!(raw.contains("event: message_start"), "missing message_start: {raw:?}");
-        assert!(raw.contains("event: message_stop"), "missing message_stop: {raw:?}");
+        assert!(
+            raw.contains(": keep-alive\n\n"),
+            "no heartbeat emitted: {raw:?}"
+        );
+        assert!(
+            raw.contains("event: message_start"),
+            "missing message_start: {raw:?}"
+        );
+        assert!(
+            raw.contains("event: message_stop"),
+            "missing message_stop: {raw:?}"
+        );
 
         // Every keep-alive precedes the first real event — never spliced into a frame.
         let first_event = raw.find("event: ").expect("an event exists");

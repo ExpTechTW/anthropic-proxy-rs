@@ -260,10 +260,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 .timer(TokioTimer::new()) // required for header_read_timeout to take effect
                 .header_read_timeout(std::time::Duration::from_secs(30));
 
-            if let Err(err) = builder
-                .serve_connection_with_upgrades(io, service)
-                .await
-            {
+            if let Err(err) = builder.serve_connection_with_upgrades(io, service).await {
                 // Usually just a client that opened a socket and sent nothing.
                 tracing::trace!("connection error: {err:#}");
             }
