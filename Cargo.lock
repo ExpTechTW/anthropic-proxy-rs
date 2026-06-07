@@ -85,6 +85,7 @@ dependencies = [
  "daemonize",
  "dotenvy",
  "futures",
+ "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",
  "pin-project",

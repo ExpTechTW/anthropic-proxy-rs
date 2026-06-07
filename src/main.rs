@@ -14,6 +14,9 @@ use clap::Parser;
 use cli::{Cli, Command};
 use config::Config;
 use daemonize::Daemonize;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto::Builder as ConnBuilder;
+use hyper_util::service::TowerToHyperService;
 use reqwest::Client;
 use std::sync::Arc;
 use tower_http::{
@@ -225,9 +228,47 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     tracing::info!("Listening on {}", addr);
     tracing::info!("Proxy ready to accept requests");
 
-    axum::serve(listener, app).await?;
+    // Manual accept loop instead of `axum::serve`: the latter builds the hyper
+    // connection with no timer, which silently disables hyper's built-in 30s
+    // header-read timeout (a `Dur::Default` only fires when a `Timer` is installed).
+    // Here we install `TokioTimer` and set `header_read_timeout` so a client that
+    // connects and then dribbles (or never finishes) its request headers — slowloris —
+    // can't pin a connection open indefinitely.
+    //
+    // The timeout bounds ONLY the request-header read: once headers are in, the handler
+    // runs and the streamed response body is unbounded, so long generations (and the
+    // heartbeat that keeps them alive) are never cut. This mirrors the Go gateway's
+    // `ReadHeaderTimeout: 30s` with the same no-WriteTimeout streaming semantics.
+    loop {
+        let (tcp, _peer) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                // Transient (e.g. EMFILE) — back off briefly so we don't hot-loop.
+                tracing::warn!("accept failed: {err}");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
 
-    Ok(())
+        let io = TokioIo::new(tcp);
+        let service = TowerToHyperService::new(app.clone());
+
+        tokio::spawn(async move {
+            let mut builder = ConnBuilder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(TokioTimer::new()) // required for header_read_timeout to take effect
+                .header_read_timeout(std::time::Duration::from_secs(30));
+
+            if let Err(err) = builder
+                .serve_connection_with_upgrades(io, service)
+                .await
+            {
+                // Usually just a client that opened a socket and sent nothing.
+                tracing::trace!("connection error: {err:#}");
+            }
+        });
+    }
 }
 
 async fn health_handler() -> &'static str {

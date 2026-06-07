@@ -51,6 +51,9 @@ daemonize = "0.5"
 # Server utilities
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
+# Manual accept loop (axum::serve installs no timer, so hyper's header-read timeout
+# is inert) — lets us bound the request-header read to guard against slowloris.
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 
 # Async streams
 async-stream = "0.3"
