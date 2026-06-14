@@ -8,14 +8,31 @@ COPY . .
 RUN cargo build --release --locked \
     && strip target/release/anthropic-proxy
 
-FROM debian:bookworm-slim
+# Runtime bundles Node + open-websearch (started alongside the proxy by
+# docker-entrypoint.sh) so the proxy can emulate Anthropic's server-side `web_search`.
+FROM node:20-bookworm-slim
 
+# ca-certificates for TLS; openssh-client + sshpass + glider power the optional SSH egress-proxy
+# pool (round-robin + health checks) that spreads searches across IPs.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl openssh-client sshpass \
+    && curl -fsSL https://github.com/nadoo/glider/releases/download/v0.16.4/glider_0.16.4_linux_amd64.tar.gz \
+        | tar -xz -C /tmp \
+    && mv /tmp/glider_*/glider /usr/local/bin/glider \
+    && chmod +x /usr/local/bin/glider \
+    && rm -rf /tmp/glider_* \
+    && apt-get purge -y --auto-remove curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/anthropic-proxy /usr/local/bin/
+# Co-located web-search backend. Pinned for reproducibility; no Playwright dep (lean).
+RUN npm install -g open-websearch@2.1.11 && npm cache clean --force
 
+COPY --from=builder /build/target/release/anthropic-proxy /usr/local/bin/
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# 3000 = proxy (published); 3100 = open-websearch (internal to the container only).
 EXPOSE 3000
 
-ENTRYPOINT ["anthropic-proxy"]
+ENTRYPOINT ["docker-entrypoint.sh"]

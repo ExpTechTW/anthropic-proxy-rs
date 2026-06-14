@@ -26,6 +26,14 @@ pub struct Config {
     /// so a fronting proxy (e.g. Cloudflare's free plan, 100s) doesn't abort the stream
     /// during the gap before the first token. 0 disables the heartbeat.
     pub heartbeat_secs: u64,
+    /// MCP (Streamable HTTP) endpoint of the co-located `open-websearch` server, used to
+    /// emulate Anthropic's server-side `web_search` / `web_fetch` tools for models that
+    /// can't browse. Defaults to the in-container instance started by docker-entrypoint.sh.
+    pub websearch_url: String,
+    /// The model the web-search/fetch agent loop routes its backend calls through (its "search
+    /// agent id", e.g. `auto`). `None` (env unset) disables emulation entirely: the web tools
+    /// are stripped and the client gets an empty result instead of a real search.
+    pub websearch_model: Option<String>,
 }
 
 impl Default for Config {
@@ -46,6 +54,8 @@ impl Default for Config {
             verbose: false,
             log_requests: false,
             heartbeat_secs: 15,
+            websearch_url: "http://localhost:3100/mcp".to_string(),
+            websearch_model: None,
         }
     }
 }
@@ -242,6 +252,17 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(15);
 
+        let websearch_url = env::var("ANTHROPIC_PROXY_WEBSEARCH_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "http://localhost:3100/mcp".to_string());
+
+        let websearch_model = env::var("ANTHROPIC_PROXY_WEBSEARCH_MODEL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
         // Validate: UPSTREAM_API_KEY_PASSTHROUGH requires UPSTREAM_API_KEY to be unset
         if passthrough_api_key && api_key.is_some() {
             bail!(
@@ -267,6 +288,8 @@ impl Config {
             verbose,
             log_requests,
             heartbeat_secs,
+            websearch_url,
+            websearch_model,
         })
     }
 

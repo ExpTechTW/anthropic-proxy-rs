@@ -125,6 +125,9 @@ pub struct Tool {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    // Server-side tools (e.g. `web_search_20250305`) carry only `type` + `name` and omit
+    // `input_schema`; default it so such a request still deserializes instead of 400ing.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub input_schema: Value,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub tool_type: Option<String>,

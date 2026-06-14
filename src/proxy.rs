@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::error::{ProxyError, ProxyResult};
 use crate::metrics;
 use crate::models::{anthropic, openai};
-use crate::translate::{core, pipeline, stream};
+use crate::translate::{core, pipeline, stream, websearch_agent};
 use axum::{
     body::Body,
     http::{HeaderMap, HeaderValue, StatusCode},
@@ -19,7 +19,7 @@ pub async fn proxy_handler(
     Extension(config): Extension<Arc<Config>>,
     Extension(client): Extension<Client>,
     headers: HeaderMap,
-    Json(req): Json<anthropic::AnthropicRequest>,
+    Json(mut req): Json<anthropic::AnthropicRequest>,
 ) -> ProxyResult<Response> {
     let is_streaming = req.stream.unwrap_or(false);
     let start = Instant::now();
@@ -41,6 +41,18 @@ pub async fn proxy_handler(
         );
     }
 
+    // Emulate Anthropic's server-side web_search/web_fetch for models that can't browse:
+    // detect those tools and, when a search-agent model is configured, rewrite them into
+    // callable function tools and route to the agent loop. When unset, emulation is disabled —
+    // strip the tools so the client gets an empty result instead of a broken/hanging search.
+    let has_web_tools = websearch_agent::detect(&req);
+    let use_websearch = has_web_tools && config.websearch_model.is_some();
+    if use_websearch {
+        websearch_agent::rewrite_tools(&mut req);
+    } else if has_web_tools {
+        websearch_agent::strip_web_tools(&mut req);
+    }
+
     let policy = translation_policy(&config);
     let openai_req = pipeline::translate_request(req, &policy)?;
     let upstream_model = openai_req.model.clone();
@@ -52,7 +64,9 @@ pub async fn proxy_handler(
         );
     }
 
-    let result = if is_streaming {
+    let result = if use_websearch {
+        websearch_agent::handle(config, client, openai_req, api_key, is_streaming).await
+    } else if is_streaming {
         handle_streaming(config, client, openai_req, api_key).await
     } else {
         handle_non_streaming(config, client, openai_req, api_key).await
@@ -94,9 +108,25 @@ fn request_fields_summary(req: &anthropic::AnthropicRequest) -> String {
         let messages = obj
             .remove("messages")
             .map_or(0, |m| m.as_array().map_or(0, Vec::len));
-        let tools = obj
-            .remove("tools")
-            .map_or(0, |t| t.as_array().map_or(0, Vec::len));
+        // Keep each tool's `type` (server tools like `web_search_20250305`) or `name` (custom
+        // tools) so we can see what the client actually requests — e.g. whether Claude Code
+        // sends a server-side `web_search` tool we'd need to emulate — without dumping schemas.
+        let tools_value = obj.remove("tools").unwrap_or(serde_json::Value::Null);
+        let tool_ids: Vec<String> = tools_value
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|t| {
+                        t.get("type")
+                            .or_else(|| t.get("name"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("?")
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tools = tools_value.as_array().map_or(0, Vec::len);
         let system = match obj.remove("system") {
             Some(serde_json::Value::Array(a)) => a.len(),
             Some(serde_json::Value::String(_)) => 1,
@@ -104,6 +134,7 @@ fn request_fields_summary(req: &anthropic::AnthropicRequest) -> String {
         };
         obj.insert("messages_count".to_string(), messages.into());
         obj.insert("tools_count".to_string(), tools.into());
+        obj.insert("tools".to_string(), tool_ids.into());
         obj.insert("system_blocks".to_string(), system.into());
     }
     serde_json::to_string(&value).unwrap_or_default()
@@ -942,7 +973,10 @@ mod tests {
                 {"role": "user", "content": "hello"},
                 {"role": "assistant", "content": "hi"}
             ],
-            "tools": [{"name": "Bash", "input_schema": {}}],
+            "tools": [
+                {"name": "Bash", "input_schema": {}},
+                {"type": "web_search_20250305", "name": "web_search"}
+            ],
             // an unknown/new field we want to surface for debugging
             "output_config": {"effort": "xhigh"}
         }))
@@ -952,10 +986,12 @@ mod tests {
         // Bulky content replaced by counts.
         assert!(summary.get("messages").is_none());
         assert!(summary.get("system").is_none());
-        assert!(summary.get("tools").is_none());
         assert_eq!(summary["messages_count"], json!(2));
-        assert_eq!(summary["tools_count"], json!(1));
+        assert_eq!(summary["tools_count"], json!(2));
         assert_eq!(summary["system_blocks"], json!(1));
+        // Tool identifiers are kept (type for server tools, name for custom) so a
+        // server-side `web_search` request is visible in the debug log.
+        assert_eq!(summary["tools"], json!(["Bash", "web_search_20250305"]));
         // Control + unknown fields survive for debugging.
         assert_eq!(summary["model"], json!("claude-opus-4-8"));
         assert_eq!(summary["output_config"]["effort"], json!("xhigh"));

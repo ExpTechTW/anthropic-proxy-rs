@@ -5,6 +5,7 @@ mod metrics;
 mod models;
 mod proxy;
 mod translate;
+mod websearch;
 
 use axum::{
     routing::{get, post},
