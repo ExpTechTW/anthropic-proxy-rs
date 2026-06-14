@@ -16,6 +16,7 @@ High-performance Rust proxy that translates the **Anthropic Messages API** into 
 - **Tool calling** — function/tool calling incl. `tool_choice`
 - **Universal** — any OpenAI-compatible API (OpenRouter, OpenAI, Azure, local LLMs)
 - **Extended thinking** — detects Claude's reasoning mode and routes models accordingly
+- **Web search & fetch** — emulates Anthropic's server-side `web_search` / `web_fetch` for models that can't browse, via a bundled [open-websearch](https://github.com/aas-ee/open-websearch)
 - **Resilient** — retries transient failures, preserves upstream status codes, 600 s request timeout
 - **Drop-in** — works with the official Anthropic SDKs and Claude Code
 
@@ -116,6 +117,8 @@ To compile from source instead, use [`Dockerfile.source`](Dockerfile.source):
 docker build -f Dockerfile.source -t anthropic-proxy .
 ```
 
+> Both images bundle Node + [open-websearch](https://github.com/aas-ee/open-websearch) (started alongside the proxy) plus an optional SSH egress-proxy pool, powering the `web_search` / `web_fetch` emulation — see [Web search & fetch](#web-search--fetch).
+
 ## Use with Claude Code
 
 ```bash
@@ -193,6 +196,9 @@ Set via environment or a `.env` file:
 | `ANTHROPIC_PROXY_MODEL_MAP` | No | – | Exact model remapping before the upstream call (`source=target;other=target`) |
 | `ANTHROPIC_PROXY_UPSTREAM_TOKENIZE` | No | `false` | Use the upstream's vLLM-style `/tokenize` for **exact** `count_tokens` and accurate overflow clamping, instead of a local estimate |
 | `ANTHROPIC_PROXY_EFFORT_MAP` | No | – | Map Anthropic thinking → the OpenAI `reasoning_effort` field (see below) |
+| `ANTHROPIC_PROXY_WEBSEARCH_MODEL` | No | – | Model the `web_search`/`web_fetch` agent loop routes through (e.g. `auto`). **Unset disables emulation** (the web tools are stripped). See [Web search & fetch](#web-search--fetch) |
+| `ANTHROPIC_PROXY_WEBSEARCH_URL` | No | `http://localhost:3100/mcp` | open-websearch MCP endpoint used for the emulation |
+| `ANTHROPIC_PROXY_HEARTBEAT_SECS` | No | `15` | Seconds of streaming-output silence before an SSE `: keep-alive` comment (stops a fronting proxy timing out before the first token / during a search). `0` disables |
 | `REASONING_MODEL` | No | (request model) | Model used when extended thinking is enabled\*\* |
 | `COMPLETION_MODEL` | No | (request model) | Model used for standard requests (no thinking)\*\* |
 | `DEBUG` | No | `false` | Debug logging (`1` or `true`) |
@@ -270,6 +276,24 @@ anthropic-proxy stop                # stop
 tail -f /tmp/anthropic-proxy.log    # logs
 ```
 
+## Web search & fetch
+
+The proxy can **emulate Anthropic's server-side `web_search` and `web_fetch` tools** so models that can't browse (local LLMs, most OpenAI-compatible backends) still answer with live web data. When a request carries a `web_search_*` / `web_fetch_*` server tool, the proxy:
+
+1. rewrites it into a callable function tool the backend model can invoke,
+2. runs the tool loop itself — calling a bundled [**open-websearch**](https://github.com/aas-ee/open-websearch) (DuckDuckGo) for each search/fetch and feeding the results back to the model until it answers (bounded by a per-request search/fetch budget),
+3. returns faithful Anthropic content blocks — `server_tool_use` + `web_search_tool_result` / `web_fetch_tool_result` + the answer text — for both streaming and non-streaming.
+
+Long, multi-round searches are kept alive with SSE `: keep-alive` heartbeats (see `ANTHROPIC_PROXY_HEARTBEAT_SECS`) so a fronting proxy (e.g. Cloudflare's 100 s idle limit) doesn't drop the stream. The agent loop forces low effort and disables chain-of-thought for its own rounds to stay responsive.
+
+Enable it by setting **`ANTHROPIC_PROXY_WEBSEARCH_MODEL`** to the model the loop should route through (e.g. `auto` to let a gateway load-balance across backends). When unset, emulation is **off** and the web tools are stripped from the request.
+
+The provided [`Dockerfile`](Dockerfile) / [`Dockerfile.source`](Dockerfile.source) bundle Node + open-websearch and start it alongside the proxy (MCP on `:3100`), so no extra service is needed.
+
+### Egress-proxy rotation (optional)
+
+To spread searches across multiple source IPs and avoid single-IP rate-limiting, mount a proxy-list file at `/etc/websearch-ssh-proxies.txt` — one `user@host[:port] password` per line (`#` comments allowed). The container opens an SSH SOCKS tunnel per host (auto-reconnecting) and fronts them with [glider](https://github.com/nadoo/glider) (round-robin + health checks) as a single HTTP proxy that open-websearch routes through. With no file mounted, searches go out directly. Keep this file outside the build context and out of version control — it holds credentials.
+
 ## Supported Features
 
 ✅ Text messages
@@ -279,6 +303,7 @@ tail -f /tmp/anthropic-proxy.log    # logs
 ✅ `tool_choice` — `auto` / `any` / `tool` / `none`, incl. `disable_parallel_tool_use`
 ✅ Streaming responses (SSE; handles `\n\n` and `\r\n\r\n` framing)
 ✅ Extended thinking (automatic model routing; `reasoning_content` preserved in both streaming and non-streaming)
+✅ Server-side `web_search` / `web_fetch` emulation (runs the loop against a bundled open-websearch; faithful `server_tool_use` + `*_tool_result` blocks; streaming + non-streaming; SSE heartbeats) — see [Web search & fetch](#web-search--fetch)
 ✅ `metadata.user_id` (forwarded as OpenAI `user`)
 ✅ `refusal` stop reason (mapped from upstream `content_filter`)
 ✅ Stop sequences, `max_tokens`, `temperature`, `top_p`
@@ -333,8 +358,8 @@ The following Anthropic API features are **not supported** (Claude Code and simi
 - `service_tier` parameter (no portable OpenAI-compatible equivalent)
 - `context_management` parameter (Anthropic server-side feature; no upstream equivalent)
 - `container` parameter (Anthropic code-execution sandbox; no upstream equivalent)
-- Citations in responses
-- `pause_turn` stop reason (only emitted by Anthropic server-side tool loops, which this proxy does not relay)
+- Inline citations — emulated `web_search`/`web_fetch` return result blocks, but without inline `web_search_result_location` citation markers
+- `pause_turn` stop reason — the proxy runs the emulated web-tool loop to completion (kept alive with heartbeats) and returns `end_turn`, so it never emits `pause_turn`
 - Message Batches API
 - Files API
 - Admin API
