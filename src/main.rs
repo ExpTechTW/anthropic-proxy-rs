@@ -4,6 +4,7 @@ mod error;
 mod metrics;
 mod models;
 mod proxy;
+mod skills;
 mod translate;
 mod websearch;
 
@@ -166,6 +167,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     }
     if !config.effort_map.is_empty() {
         tracing::info!("Effort map: thinking budget -> effort level enabled");
+    }
+    if config.skills.enabled {
+        tracing::info!(
+            "Skills injection: ENABLED (qdrant={}, collection={}, embed_model={}, top_k={}, tiers=[{}])",
+            config.skills.qdrant_url,
+            config.skills.collection,
+            if config.skills.embed_model.is_empty() {
+                "<unset>"
+            } else {
+                &config.skills.embed_model
+            },
+            config.skills.top_k,
+            config.skills.inject_tiers.join(", "),
+        );
     }
     if config.log_requests {
         tracing::info!("Request logging: per-request fields (minus messages/system) enabled");

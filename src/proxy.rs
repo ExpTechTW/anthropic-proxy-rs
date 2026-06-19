@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::error::{ProxyError, ProxyResult};
 use crate::metrics;
 use crate::models::{anthropic, openai};
+use crate::skills;
 use crate::translate::{core, pipeline, stream, websearch_agent};
 use axum::{
     body::Body,
@@ -26,6 +27,24 @@ pub async fn proxy_handler(
     let client_model = req.model.clone();
 
     let api_key = resolve_api_key(&config, &headers);
+
+    // Auto-inject relevant learned skills (Stage 1). Best-effort: embedding/Qdrant failures
+    // return no skills and the request proceeds untouched, so the feature can never break a call.
+    let injected_skills = if config.skills.enabled {
+        let query = skills::last_user_text(&req).unwrap_or_default();
+        let found = skills::retrieve(&config, &client, &query, api_key.as_deref()).await;
+        let ids = skills::inject(&mut req, &found);
+        if !ids.is_empty() {
+            tracing::info!(
+                count = ids.len(),
+                titles = %found.iter().map(|s| s.title.as_str()).collect::<Vec<_>>().join(" | "),
+                "skills: injected into request"
+            );
+        }
+        ids
+    } else {
+        Vec::new()
+    };
 
     tracing::debug!(model = %client_model, streaming = is_streaming, "received request");
     metrics::request_started(is_streaming);
@@ -90,6 +109,16 @@ pub async fn proxy_handler(
             model = %client_model, upstream = %upstream_model,
             status, elapsed_ms, streaming = is_streaming, "request failed: {err}"
         ),
+    }
+
+    // Transparency (#4): surface which learned skills were injected, without affecting behaviour.
+    let mut result = result;
+    if !injected_skills.is_empty() {
+        if let Ok(resp) = result.as_mut() {
+            if let Ok(value) = HeaderValue::from_str(&injected_skills.join(",")) {
+                resp.headers_mut().insert("x-injected-skills", value);
+            }
+        }
     }
 
     result

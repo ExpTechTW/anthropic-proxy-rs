@@ -34,6 +34,101 @@ pub struct Config {
     /// agent id", e.g. `auto`). `None` (env unset) disables emulation entirely: the web tools
     /// are stripped and the client gets an empty result instead of a real search.
     pub websearch_model: Option<String>,
+    /// Self-learning skill-injection settings (read path; see [`crate::skills`]).
+    pub skills: SkillsConfig,
+}
+
+/// Configuration for auto-injecting learned skills into requests. Disabled by default — the whole
+/// feature is gated behind `ANTHROPIC_PROXY_SKILLS_ENABLED` so default behaviour is unchanged.
+#[derive(Debug, Clone)]
+pub struct SkillsConfig {
+    /// Master switch. When false, the proxy never embeds, queries Qdrant, or injects.
+    pub enabled: bool,
+    /// Qdrant base URL (co-located service), e.g. `http://qdrant:6333`.
+    pub qdrant_url: String,
+    /// Qdrant collection holding the skill points.
+    pub collection: String,
+    /// Explicit embeddings endpoint; `None` derives one from the first upstream chat URL.
+    pub embed_url: Option<String>,
+    /// Embedding model name sent to the embeddings endpoint. Empty disables retrieval.
+    pub embed_model: String,
+    /// Max skills injected per request — capped low; over-injection degrades quality.
+    pub top_k: u32,
+    /// Minimum cosine score for a skill to be injected (filters weak/irrelevant matches).
+    pub min_score: f32,
+    /// Trust tiers eligible for injection (e.g. `verified`, `trusted`). Candidates are excluded.
+    pub inject_tiers: Vec<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            qdrant_url: "http://qdrant:6333".to_string(),
+            collection: "skills".to_string(),
+            embed_url: None,
+            embed_model: String::new(),
+            top_k: 3,
+            min_score: 0.5,
+            inject_tiers: vec!["verified".to_string(), "trusted".to_string()],
+        }
+    }
+}
+
+impl SkillsConfig {
+    fn from_env() -> Self {
+        let d = SkillsConfig::default();
+        let enabled = env::var("ANTHROPIC_PROXY_SKILLS_ENABLED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let qdrant_url = env::var("ANTHROPIC_PROXY_SKILLS_QDRANT_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or(d.qdrant_url);
+        let collection = env::var("ANTHROPIC_PROXY_SKILLS_COLLECTION")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or(d.collection);
+        let embed_url = env::var("ANTHROPIC_PROXY_SKILLS_EMBED_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let embed_model = env::var("ANTHROPIC_PROXY_SKILLS_EMBED_MODEL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_default();
+        let top_k = env::var("ANTHROPIC_PROXY_SKILLS_TOP_K")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d.top_k);
+        let min_score = env::var("ANTHROPIC_PROXY_SKILLS_MIN_SCORE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d.min_score);
+        let inject_tiers = env::var("ANTHROPIC_PROXY_SKILLS_INJECT_TIERS")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or(d.inject_tiers);
+        SkillsConfig {
+            enabled,
+            qdrant_url,
+            collection,
+            embed_url,
+            embed_model,
+            top_k,
+            min_score,
+            inject_tiers,
+        }
+    }
 }
 
 impl Default for Config {
@@ -56,6 +151,7 @@ impl Default for Config {
             heartbeat_secs: 15,
             websearch_url: "http://localhost:3100/mcp".to_string(),
             websearch_model: None,
+            skills: SkillsConfig::default(),
         }
     }
 }
@@ -263,6 +359,8 @@ impl Config {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
+        let skills = SkillsConfig::from_env();
+
         // Validate: UPSTREAM_API_KEY_PASSTHROUGH requires UPSTREAM_API_KEY to be unset
         if passthrough_api_key && api_key.is_some() {
             bail!(
@@ -290,6 +388,7 @@ impl Config {
             heartbeat_secs,
             websearch_url,
             websearch_model,
+            skills,
         })
     }
 
@@ -309,6 +408,24 @@ impl Config {
                     .expect("URLs should be validated during configuration loading")
             })
             .collect()
+    }
+
+    /// Upstream `/embeddings` URLs (siblings of the chat-completions endpoints), used for
+    /// skill-retrieval embeddings when no explicit `ANTHROPIC_PROXY_SKILLS_EMBED_URL` is set.
+    pub fn embeddings_urls(&self) -> Vec<String> {
+        self.chat_completions_urls()
+            .into_iter()
+            .map(|url| url.replace("/chat/completions", "/embeddings"))
+            .collect()
+    }
+
+    /// The embeddings endpoint for skill retrieval: the explicit override if set, else the first
+    /// upstream-derived `/embeddings` URL. `None` only if there are somehow no upstreams.
+    pub fn skills_embed_url(&self) -> Option<String> {
+        if let Some(url) = &self.skills.embed_url {
+            return Some(url.clone());
+        }
+        self.embeddings_urls().into_iter().next()
     }
 
     pub fn models_urls(&self) -> Vec<String> {
