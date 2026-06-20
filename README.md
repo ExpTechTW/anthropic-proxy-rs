@@ -198,7 +198,8 @@ Set via environment or a `.env` file:
 | `ANTHROPIC_PROXY_UPSTREAM_TOKENIZE` | No | `false` | Use the upstream's vLLM-style `/tokenize` for **exact** `count_tokens` and accurate overflow clamping, instead of a local estimate |
 | `ANTHROPIC_PROXY_EFFORT_MAP` | No | – | Map Anthropic thinking → the OpenAI `reasoning_effort` field (see below) |
 | `ANTHROPIC_PROXY_WEBSEARCH_MODEL` | No | – | Model the `web_search`/`web_fetch` agent loop routes through (e.g. `auto`). **Unset disables emulation** (the web tools are stripped). See [Web search & fetch](#web-search--fetch) |
-| `ANTHROPIC_PROXY_WEBSEARCH_URL` | No | `http://localhost:3100/mcp` | open-websearch MCP endpoint used for the emulation |
+| `ANTHROPIC_PROXY_WEBSEARCH_URL` | No | `http://localhost:3100/mcp` | open-websearch MCP endpoint used for the emulation (and for `web_fetch`) |
+| `ANTHROPIC_PROXY_SEARXNG_URL` | No | – | Self-hosted [SearXNG](https://github.com/searxng/searxng) base URL (e.g. `http://searxng:8080`). When set, `web_search` runs through SearXNG (70+ engines, deduped) instead of open-websearch; `web_fetch` still uses open-websearch. See [Web search & fetch](#web-search--fetch) |
 | `ANTHROPIC_PROXY_HEARTBEAT_SECS` | No | `15` | Seconds of streaming-output silence before an SSE `: keep-alive` comment (stops a fronting proxy timing out before the first token / during a search). `0` disables |
 | `REASONING_MODEL` | No | (request model) | Model used when extended thinking is enabled\*\* |
 | `COMPLETION_MODEL` | No | (request model) | Model used for standard requests (no thinking)\*\* |
@@ -294,6 +295,10 @@ The provided [`Dockerfile`](Dockerfile) / [`Dockerfile.source`](Dockerfile.sourc
 ### Egress-proxy rotation (optional)
 
 To spread searches across multiple source IPs and avoid single-IP rate-limiting, mount a proxy-list file at `/etc/websearch-ssh-proxies.txt` — one `user@host[:port] password` per line (`#` comments allowed). The container opens an SSH SOCKS tunnel per host (auto-reconnecting) and fronts them with [glider](https://github.com/nadoo/glider) (round-robin + health checks) as a single HTTP proxy that open-websearch routes through. With no file mounted, searches go out directly. Keep this file outside the build context and out of version control — it holds credentials.
+
+### SearXNG search backend (optional, stronger)
+
+`open-websearch` scrapes a few engines directly. For broader, deduped multi-source results, point **`ANTHROPIC_PROXY_SEARXNG_URL`** at a self-hosted [SearXNG](https://github.com/searxng/searxng) (70+ engines, JSON API). When set, **`web_search` runs through SearXNG** while **`web_fetch` stays on open-websearch** (SearXNG has no page fetch); a SearXNG error falls back to open-websearch search, so the feature degrades gracefully. Two SearXNG settings matter: enable the JSON format (`search.formats: [html, json]`), and — if the host can't reach the engines directly — route egress via `outgoing.proxies` (httpx; supports SOCKS5). SearXNG can reuse the same glider egress pool: bind glider on the container network and set `outgoing.proxies` to `all://: [http://<proxy-host>:7890]`.
 
 ## Self-learning skills
 

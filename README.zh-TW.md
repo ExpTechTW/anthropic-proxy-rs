@@ -198,6 +198,10 @@ anthropic-proxy --help
 | `COMPLETION_MODEL` | 否 | (請求模型) | 一般請求(無思考)使用的模型\*\* |
 | `DEBUG` | 否 | `false` | 除錯日誌(`1` 或 `true`) |
 | `VERBOSE` | 否 | `false` | 詳細日誌(`1` 或 `true`) |
+| `ANTHROPIC_PROXY_WEBSEARCH_MODEL` | 否 | – | `web_search`/`web_fetch` 代理循環使用的模型(如 `auto`)。**未設則停用模擬**(剝除 web 工具)。見[網路搜尋與抓取](#網路搜尋與抓取) |
+| `ANTHROPIC_PROXY_WEBSEARCH_URL` | 否 | `http://localhost:3100/mcp` | open-websearch MCP 端點(也用於 `web_fetch`) |
+| `ANTHROPIC_PROXY_SEARXNG_URL` | 否 | – | 自架 [SearXNG](https://github.com/searxng/searxng) base URL(如 `http://searxng:8080`)。設定後 `web_search` 改走 SearXNG(70+ 引擎、去重),`web_fetch` 仍用 open-websearch |
+| `ANTHROPIC_PROXY_HEARTBEAT_SECS` | 否 | `15` | 串流靜默多少秒後送 SSE `: keep-alive`(避免前置 proxy 在首 token 前/搜尋中逾時)。`0` 停用 |
 
 \* 若上游端點需要驗證則為必填。
 \*\* 代理會偵測請求是否啟用延伸思考(`thinking` 參數),若是則路由到 `REASONING_MODEL`;沒有思考的請求使用 `COMPLETION_MODEL`。兩者皆未設定時,使用客戶端請求中的模型。`ANTHROPIC_PROXY_MODEL_MAP` 會在這個選擇**之後**才套用。
@@ -270,6 +274,20 @@ anthropic-proxy status              # 檢查
 anthropic-proxy stop                # 停止
 tail -f /tmp/anthropic-proxy.log    # 日誌
 ```
+
+## 網路搜尋與抓取
+
+本代理可**模擬 Anthropic 伺服器端的 `web_search` / `web_fetch` 工具**,讓不能上網的模型(本地 LLM、多數 OpenAI 相容後端)也能用即時網路資料作答。當請求帶有 `web_search_*` / `web_fetch_*` 伺服器工具時,代理會:
+
+1. 將其改寫成後端模型可呼叫的 function tool,
+2. 自己跑工具循環——每次搜尋/抓取呼叫內建的 [**open-websearch**](https://github.com/aas-ee/open-websearch),把結果餵回模型直到它作答(有每請求的搜尋/抓取預算上限),
+3. 回傳忠實的 Anthropic 內容區塊(`server_tool_use` + `web_search_tool_result` / `web_fetch_tool_result` + 答案文字),串流與非串流皆可。
+
+長時間多輪搜尋以 SSE `: keep-alive` heartbeat 維持(見 `ANTHROPIC_PROXY_HEARTBEAT_SECS`)。設定 **`ANTHROPIC_PROXY_WEBSEARCH_MODEL`** 啟用(未設則停用、剝除 web 工具)。
+
+**SearXNG 搜尋後端(選用,更強)**:把 **`ANTHROPIC_PROXY_SEARXNG_URL`** 指向自架 [SearXNG](https://github.com/searxng/searxng)(70+ 引擎、跨引擎去重),`web_search` 即改走 SearXNG,`web_fetch` 仍用 open-websearch;SearXNG 出錯會自動回退 open-websearch(優雅降級)。需在 SearXNG 開啟 JSON 格式(`search.formats: [html, json]`);若主機無法直連引擎,用 `outgoing.proxies`(支援 SOCKS5)導出口——可共用下方的 glider egress pool(`all://: [http://<proxy-host>:7890]`)。
+
+**Egress 輪替(選用)**:掛載 `/etc/websearch-ssh-proxies.txt`(每行 `user@host[:port] password`),代理會為每個 host 開自動重連的 SSH SOCKS 隧道,並用 [glider](https://github.com/nadoo/glider)(輪替 + 健檢)整合成單一 HTTP proxy 供 open-websearch 走。未掛載則直連。此檔含憑證,請置於建置情境外、勿納入版控。
 
 ## 自我學習技能
 
@@ -344,8 +362,9 @@ jq -r 'select(.ev=="promote")|"\(.tier)\t\(.title)"' skills-events-*.jsonl      
     image: qdrant/qdrant
   embeddings:                       # OpenAI 相容 /v1/embeddings(多語 bge-m3)
     image: ghcr.io/ggml-org/llama.cpp:server
-    command: ["-hf","gpustack/bge-m3-GGUF:Q4_K_M","--embeddings","--pooling","cls","-c","8192","-ub","8192","--host","0.0.0.0","--port","8080"]
-    # -ub 8192 讓它能把整段輸入塞進一個 physical batch 做 embedding;沒設的話超過預設 512 token 會回 500。
+    command: ["-hf","gpustack/bge-m3-GGUF:Q4_K_M","--embeddings","--pooling","cls","-c","8192","-ub","2048","--host","0.0.0.0","--port","8080"]
+    # -ub 是 physical batch,也決定 compute buffer 記憶體。預設 512 太小(超過約 512 token 會回 500);
+    # 2048 夠用且省記憶體。別用 8192 之類大值——會吃掉好幾 GB compute buffer。
   anthropic-proxy:
     environment:
       ANTHROPIC_PROXY_SKILLS_ENABLED: "true"
@@ -424,8 +443,8 @@ location / {
 - `service_tier` 參數(沒有可移植的 OpenAI 相容對應)
 - `context_management` 參數(Anthropic 伺服器端功能;上游無對應)
 - `container` 參數(Anthropic 程式碼執行沙箱;上游無對應)
-- 回應中的 Citations
-- `pause_turn` 停止原因(僅由 Anthropic 伺服器端工具循環產生,本代理不轉發)
+- 模擬的 `web_search`/`web_fetch` 結果區塊中沒有行內 citations(無 `web_search_result_location` 標記)
+- `pause_turn` 停止原因(本代理會把模擬的 web 工具循環跑完——期間以 heartbeat 維持連線——並回傳 `end_turn`,因此不會產生 `pause_turn`)
 - Message Batches API
 - Files API
 - Admin API
