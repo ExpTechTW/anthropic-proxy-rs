@@ -307,8 +307,19 @@ tail -f /tmp/anthropic-proxy.log    # 日誌
 | `ANTHROPIC_PROXY_SKILLS_CURATE_INTERVAL_SECS` | `600` | 策展迴圈間隔 |
 | `ANTHROPIC_PROXY_SKILLS_PROACTIVE_INTERVAL_SECS` | `600` | 主動學習迴圈間隔 |
 | `ANTHROPIC_PROXY_SKILLS_RETENTION_DAYS` | `30` | 淘汰超過此天數的未驗證 candidate |
+| `ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH` | – | 精簡 JSONL 學習事件記錄路徑(空字串=關閉);用 volume 持久化 |
+| `ANTHROPIC_PROXY_SKILLS_EVENTLOG_RETENTION_DAYS` | `7` | 事件記錄保留天數 |
 
 > **安全。** 從開放網路學習是已知的中毒風險,所以信任分層是承重控制:未驗證知識絕不注入、升級需多個獨立來源佐證(而非模型自信)、讀網頁的 LLM 被隔離(無工具／無寫入)。請把你的 embeddings／LLM／Qdrant 端點視為可信基礎設施。
+
+**分析學習狀況。** 設 `ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH` 會記錄一份精簡 JSONL 學習漏斗軌跡——每個 `inject`／`distill`／`promote`／`reject`／`curate`／`proactive` 事件一行,在請求路徑外寫入,按 `…_EVENTLOG_RETENTION_DAYS`(預設 7 天)淘汰。用 `jq` 分析:
+
+```bash
+jq -r .ev events.jsonl | sort | uniq -c                                            # 漏斗各階段數量
+jq -r 'select(.ev=="distill")|.skills[]' events.jsonl                               # 學到了什麼
+jq -r 'select(.ev=="inject")|.skills[]' events.jsonl | sort | uniq -c | sort -rn    # 最常被用到的技能
+jq -r 'select(.ev=="promote")|"\(.tier)\t\(.title)"' events.jsonl                   # 升級歷程
+```
 
 範例(Docker Compose)— 同址 Qdrant + llama.cpp embedding server,學習導向免認證的內部 backend:
 

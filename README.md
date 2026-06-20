@@ -331,8 +331,19 @@ Everything is non-parametric — "learning" is writing rows to Qdrant — and ev
 | `ANTHROPIC_PROXY_SKILLS_CURATE_INTERVAL_SECS` | `600` | Curation-loop interval |
 | `ANTHROPIC_PROXY_SKILLS_PROACTIVE_INTERVAL_SECS` | `600` | Proactive-loop interval |
 | `ANTHROPIC_PROXY_SKILLS_RETENTION_DAYS` | `30` | Drop unverified candidates older than this |
+| `ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH` | – | Path to a compact JSONL learning-event log (empty = off); persist via a volume |
+| `ANTHROPIC_PROXY_SKILLS_EVENTLOG_RETENTION_DAYS` | `7` | Days to retain event-log entries |
 
 > **Safety.** Learning from the open web is a documented poisoning vector, so the trust gate is the load-bearing control: unverified knowledge is never injected, promotion requires independent multi-source corroboration rather than the model's confidence, and the web-reading LLM is quarantined (no tools / no write access). Treat your embeddings / LLM / Qdrant endpoints as trusted infrastructure.
+
+**Analysing the learning.** Set `ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH` to record a compact JSONL trail of the learning funnel — one small line per `inject` / `distill` / `promote` / `reject` / `curate` / `proactive` event, off the request path and pruned to `…_EVENTLOG_RETENTION_DAYS` (default 7). Analyse with `jq`:
+
+```bash
+jq -r .ev events.jsonl | sort | uniq -c                                            # funnel counts
+jq -r 'select(.ev=="distill")|.skills[]' events.jsonl                               # what was learned
+jq -r 'select(.ev=="inject")|.skills[]' events.jsonl | sort | uniq -c | sort -rn    # most-used skills
+jq -r 'select(.ev=="promote")|"\(.tier)\t\(.title)"' events.jsonl                   # promotions over time
+```
 
 Example (Docker Compose) — co-located Qdrant + a llama.cpp embedding server, with learning routed at a no-auth internal backend:
 
