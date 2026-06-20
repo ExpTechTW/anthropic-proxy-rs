@@ -13,14 +13,15 @@ services:
     volumes:
       - ./qdrant-data:/qdrant/storage
 
-  # OpenAI-compatible /v1/embeddings — multilingual bge-m3, on CPU. -ub is the physical batch:
-  # the default 512 is too small (llama.cpp 500s on inputs over ~512 tokens), but large values
-  # (e.g. 8192) allocate multiple GB of compute buffer — 2048 is a good balance.
+  # OpenAI-compatible /v1/embeddings — multilingual bge-m3, on CPU. -ub is the physical batch and
+  # caps tokens per embedded chunk: the default 512 is too small (llama.cpp 500s over ~512 tokens);
+  # 2048 suits English, 4096 gives headroom for CJK chunks (denser tokens). Avoid huge values like
+  # 8192 — they allocate multiple GB of compute buffer. Pair with the docs-mcp chunk cap below.
   embeddings:
     image: ghcr.io/ggml-org/llama.cpp:server
     restart: always
     command: ["-hf","gpustack/bge-m3-GGUF:Q4_K_M","--embeddings","--pooling","cls",
-              "-c","8192","-ub","2048","--host","0.0.0.0","--port","8080"]
+              "-c","8192","-ub","4096","--host","0.0.0.0","--port","8080"]
     volumes:
       - ./llama-cache:/root/.cache/llama.cpp
 
@@ -36,6 +37,12 @@ services:
       OPENAI_API_BASE: "http://embeddings:8080/v1"
       OPENAI_API_KEY: "local"        # dummy — the endpoint needs no auth
       DOCS_MCP_EMBEDDING_MODEL: "openai:bge-m3"
+      # Indexing CJK / dense docs on a CPU embedder? Two gotchas, both fixable here:
+      #  - the 5000-char default chunk becomes ~5000-7500 CJK *tokens* > llama.cpp -ub → embed 500s;
+      #  - slow CJK embeds time out docs-mcp's request → "ConnectionError: Failed to generate embeddings".
+      # Cap the chunk so its tokens fit -ub, and shrink the batch so each request stays fast:
+      DOCS_MCP_SPLITTER_MAX_CHUNK_SIZE: "2000"   # ≈ ≤3000 CJK tokens — pair with embeddings -ub ≥ 4096
+      DOCS_MCP_EMBEDDINGS_BATCH_SIZE: "4"        # few chunks/request → no timeout on slow CPU embeds
     ports:
       - "127.0.0.1:6280:6280"
     volumes:
