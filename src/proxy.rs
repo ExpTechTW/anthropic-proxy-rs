@@ -61,6 +61,15 @@ pub async fn proxy_handler(
         Vec::new()
     };
 
+    // Docs push-injection (streaming-preserving): fetch docs for indexed libraries mentioned in
+    // the query and inject as a system block. No-op unless ANTHROPIC_PROXY_SKILLS_DOCS_INJECT=1.
+    if config.skills.docs_inject {
+        if let Some(docs) = skills::relevant_docs(&config, &client, &user_text).await {
+            skills::inject_docs(&mut req, &docs);
+            tracing::info!("skills: injected library documentation");
+        }
+    }
+
     // Stage 2: learn from this conversation's history in the background (off the request path;
     // throttled per-conversation; no-op unless ANTHROPIC_PROXY_SKILLS_LEARN is set).
     skills::maybe_spawn_distill(config.clone(), client.clone(), &req, api_key.clone());

@@ -93,6 +93,9 @@ pub struct SkillsConfig {
     pub tools: bool,
     /// docs-mcp MCP endpoint for the `search_docs` tool (None disables that tool).
     pub docs_mcp_url: Option<String>,
+    /// Push-inject docs from docs-mcp for indexed libraries mentioned in a request (streaming-safe,
+    /// unlike the tool loop). Needs `docs_mcp_url`.
+    pub docs_inject: bool,
 }
 
 impl Default for SkillsConfig {
@@ -121,6 +124,7 @@ impl Default for SkillsConfig {
             eventlog_retention_days: 7,
             tools: false,
             docs_mcp_url: None,
+            docs_inject: false,
         }
     }
 }
@@ -226,6 +230,9 @@ impl SkillsConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        let docs_inject = env::var("ANTHROPIC_PROXY_SKILLS_DOCS_INJECT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         SkillsConfig {
             enabled,
             qdrant_url,
@@ -250,6 +257,7 @@ impl SkillsConfig {
             eventlog_retention_days,
             tools,
             docs_mcp_url,
+            docs_inject,
         }
     }
 }

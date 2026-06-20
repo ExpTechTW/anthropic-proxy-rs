@@ -16,6 +16,7 @@
 mod agent;
 mod curate;
 mod distill;
+mod docs;
 mod embed;
 mod eventlog;
 mod llm;
@@ -26,6 +27,7 @@ mod verify;
 pub use agent::{
     enabled as agent_enabled, handle as agent_handle, inject_tools as agent_inject_tools,
 };
+pub use docs::relevant_docs;
 
 #[allow(unused_imports)]
 pub use store::{stable_id, QdrantClient};
@@ -147,18 +149,38 @@ pub fn inject(req: &mut anthropic::AnthropicRequest, skills: &[RetrievedSkill]) 
         rendered.push('\n');
     }
 
+    append_system_block(req, rendered);
+    skills.iter().map(|s| s.id.clone()).collect()
+}
+
+/// Inject retrieved library documentation as a system block (streaming-preserving push). No-op
+/// when empty.
+pub fn inject_docs(req: &mut anthropic::AnthropicRequest, docs: &str) {
+    if docs.trim().is_empty() {
+        return;
+    }
+    let text = format!(
+        "# Up-to-date library documentation (retrieved)\n\
+         The following are current docs for libraries mentioned in the task — prefer them over \
+         prior knowledge.\n\n{docs}"
+    );
+    append_system_block(req, text);
+}
+
+/// Append one `text` system block after the client's existing system content (so the stable
+/// client prefix is undisturbed for prefix caching).
+fn append_system_block(req: &mut anthropic::AnthropicRequest, text: String) {
     let block = anthropic::SystemMessage {
         message_type: "text".to_string(),
-        text: rendered,
+        text,
         cache_control: None,
     };
-
     let new_system = match req.system.take() {
         None => anthropic::SystemPrompt::Multiple(vec![block]),
-        Some(anthropic::SystemPrompt::Single(text)) => anthropic::SystemPrompt::Multiple(vec![
+        Some(anthropic::SystemPrompt::Single(s)) => anthropic::SystemPrompt::Multiple(vec![
             anthropic::SystemMessage {
                 message_type: "text".to_string(),
-                text,
+                text: s,
                 cache_control: None,
             },
             block,
@@ -169,8 +191,6 @@ pub fn inject(req: &mut anthropic::AnthropicRequest, skills: &[RetrievedSkill]) 
         }
     };
     req.system = Some(new_system);
-
-    skills.iter().map(|s| s.id.clone()).collect()
 }
 
 /// The text of the most recent `user` message — the retrieval query. Joins the text blocks of a
