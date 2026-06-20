@@ -76,6 +76,7 @@ pub async fn proxy_handler(
         if let Some(facts) = skills::relevant_facts(&config, &client, &user_text).await {
             skills::inject_facts(&mut req, &facts);
             tracing::info!("skills: injected current facts");
+            skills::log_event("fact_inject", serde_json::json!({"facts": facts.trim()}));
         }
     }
 

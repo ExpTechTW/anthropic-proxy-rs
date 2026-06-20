@@ -121,7 +121,9 @@ async fn run_once(config: &Config, client: &Client) {
         }
         match verify(config, client, &p).await {
             Some(true) => {
-                qc.set_payload(id, json!({"reverified_at": now})).await;
+                if qc.set_payload(id, json!({"reverified_at": now})).await {
+                    super::eventlog::record("reverify", json!({"title": p.title.clone()}));
+                }
             }
             Some(false) => {
                 if qc
