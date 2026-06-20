@@ -309,7 +309,7 @@ Knowledge lives in an external **[Qdrant](https://qdrant.tech)** vector store (n
 
 Everything is non-parametric — "learning" is writing rows to Qdrant — and every background task runs off the request path, so the latency and reliability of normal requests are unaffected.
 
-**Requirements:** a reachable Qdrant, an OpenAI-compatible **embeddings** endpoint (e.g. a small multilingual model served by [llama.cpp](https://github.com/ggml-org/llama.cpp) or Ollama), and a chat endpoint for the background learning LLM (defaults to the upstream; point `ANTHROPIC_PROXY_SKILLS_LLM_URL` at a no-auth internal backend to avoid spending a client key / user quota). Verification reuses the bundled open-websearch.
+**Requirements:** a reachable Qdrant, an OpenAI-compatible **embeddings** endpoint (e.g. a small multilingual model served by [llama.cpp](https://github.com/ggml-org/llama.cpp) or Ollama), and a chat endpoint for the background learning LLM (defaults to the upstream; point `ANTHROPIC_PROXY_SKILLS_LLM_URL` at a no-auth internal backend to avoid spending a client key / user quota, **or** at an authed/metered upstream paired with a dedicated `ANTHROPIC_PROXY_SKILLS_API_KEY` for separate token accounting). Verification reuses the bundled open-websearch.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -320,9 +320,9 @@ Everything is non-parametric — "learning" is writing rows to Qdrant — and ev
 | `ANTHROPIC_PROXY_SKILLS_COLLECTION` | `skills` | Qdrant collection name |
 | `ANTHROPIC_PROXY_SKILLS_EMBED_URL` | upstream `/embeddings` | OpenAI-compatible embeddings endpoint |
 | `ANTHROPIC_PROXY_SKILLS_EMBED_MODEL` | – | Embedding model name (empty disables retrieval) |
-| `ANTHROPIC_PROXY_SKILLS_LLM_URL` | upstream chat URL | Chat endpoint for background learning calls; when set, called with **no auth** |
+| `ANTHROPIC_PROXY_SKILLS_LLM_URL` | upstream chat URL | Chat endpoint for background learning calls. Sent with `…_API_KEY` as a bearer when that is set, else no auth — so it can target a no-auth internal backend **or** an authed/metered upstream |
 | `ANTHROPIC_PROXY_SKILLS_LLM_MODEL` | `auto` | Model for the background learning/judge calls |
-| `ANTHROPIC_PROXY_SKILLS_API_KEY` | – | Key for background calls not tied to a client request (falls back to the last-seen client key) |
+| `ANTHROPIC_PROXY_SKILLS_API_KEY` | – | Dedicated key for background calls (distil / verify / proactive). When `…_LLM_URL` is set this key is sent to it (uniformly, regardless of the triggering client); otherwise it authes the upstream fallback. Unset → falls back to the last-seen client key |
 | `ANTHROPIC_PROXY_SKILLS_TOP_K` | `3` | Max skills injected per request |
 | `ANTHROPIC_PROXY_SKILLS_MIN_SCORE` | `0.5` | Minimum cosine score to inject (filters weak matches; ~`0.45` suits bge-m3) |
 | `ANTHROPIC_PROXY_SKILLS_INJECT_TIERS` | `verified,trusted` | Tiers eligible for injection (candidates excluded) |
@@ -380,9 +380,12 @@ Example (Docker Compose) — co-located Qdrant + a llama.cpp embedding server, w
       ANTHROPIC_PROXY_SKILLS_QDRANT_URL: "http://qdrant:6333"
       ANTHROPIC_PROXY_SKILLS_EMBED_URL: "http://embeddings:8080/v1/embeddings"
       ANTHROPIC_PROXY_SKILLS_EMBED_MODEL: "bge-m3"
+      # Background learning LLM: a no-auth internal backend (cheapest), or an authed/metered
+      # upstream with a dedicated key for separate token accounting (uncomment API_KEY below).
       ANTHROPIC_PROXY_SKILLS_LLM_URL: "http://your-backend:8000/v1/chat/completions"
       ANTHROPIC_PROXY_SKILLS_LLM_MODEL: "your-model"
-      ANTHROPIC_PROXY_SKILLS_MIN_SCORE: "0.45"
+      # ANTHROPIC_PROXY_SKILLS_API_KEY: "sk-..."  # sent to LLM_URL when both are set
+      ANTHROPIC_PROXY_SKILLS_MIN_SCORE: "0.45"    # bge-m3's cosine scores are compressed
 ```
 
 ## Supported Features

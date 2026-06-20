@@ -57,9 +57,11 @@ services:
       ANTHROPIC_PROXY_SKILLS_EMBED_URL: "http://embeddings:8080/v1/embeddings"
       ANTHROPIC_PROXY_SKILLS_EMBED_MODEL: "bge-m3"
       ANTHROPIC_PROXY_SKILLS_MIN_SCORE: "0.45"     # bge-m3 cosine is compressed
-      # background learning LLM — point at a no-auth internal backend to avoid spending a client key
+      # Background learning LLM: a no-auth internal backend (cheapest, no client key spent), or an
+      # authed/metered upstream with a dedicated key for separate accounting (uncomment API_KEY).
       ANTHROPIC_PROXY_SKILLS_LLM_URL: "http://your-backend/v1/chat/completions"
       ANTHROPIC_PROXY_SKILLS_LLM_MODEL: "your-model"
+      # ANTHROPIC_PROXY_SKILLS_API_KEY: "sk-..."  # sent to LLM_URL when both are set
       # docs: push-inject for libraries named in the query (streaming preserved).
       # Prefer this over the pull tool loop (ANTHROPIC_PROXY_SKILLS_TOOLS=true), which buffers.
       ANTHROPIC_PROXY_SKILLS_DOCS_MCP_URL: "http://docs-mcp:6280/mcp"

@@ -285,7 +285,7 @@ tail -f /tmp/anthropic-proxy.log    # 日誌
 
 整套是非參數化的——「學習」就是寫 row 進 Qdrant——而且所有背景工作都在請求路徑外,正常請求的延遲與穩定性完全不受影響。
 
-**前置需求:** 可連線的 Qdrant、一個 OpenAI 相容的 **embeddings** 端點(例如以 [llama.cpp](https://github.com/ggml-org/llama.cpp) 或 Ollama 服務的小型多語模型),以及背景學習 LLM 的 chat 端點(預設用上游;把 `ANTHROPIC_PROXY_SKILLS_LLM_URL` 指向免認證的內部 backend,可避免耗用 client key／用戶額度)。驗證沿用內建的 open-websearch。
+**前置需求:** 可連線的 Qdrant、一個 OpenAI 相容的 **embeddings** 端點(例如以 [llama.cpp](https://github.com/ggml-org/llama.cpp) 或 Ollama 服務的小型多語模型),以及背景學習 LLM 的 chat 端點(預設用上游;把 `ANTHROPIC_PROXY_SKILLS_LLM_URL` 指向免認證的內部 backend,可避免耗用 client key／用戶額度,**或**指向需認證／計費的上游並搭配專用的 `ANTHROPIC_PROXY_SKILLS_API_KEY` 以分開計帳)。驗證沿用內建的 open-websearch。
 
 | 變數 | 預設 | 說明 |
 |------|------|------|
@@ -296,9 +296,9 @@ tail -f /tmp/anthropic-proxy.log    # 日誌
 | `ANTHROPIC_PROXY_SKILLS_COLLECTION` | `skills` | Qdrant collection 名稱 |
 | `ANTHROPIC_PROXY_SKILLS_EMBED_URL` | 上游 `/embeddings` | OpenAI 相容 embeddings 端點 |
 | `ANTHROPIC_PROXY_SKILLS_EMBED_MODEL` | – | embedding 模型名(空字串停用檢索) |
-| `ANTHROPIC_PROXY_SKILLS_LLM_URL` | 上游 chat URL | 背景學習呼叫的 chat 端點;設定後以**免認證**呼叫 |
+| `ANTHROPIC_PROXY_SKILLS_LLM_URL` | 上游 chat URL | 背景學習呼叫的 chat 端點。`…_API_KEY` 有設時會帶上當 bearer,否則免認證——可指向免認證內部 backend **或**需認證／計費的上游 |
 | `ANTHROPIC_PROXY_SKILLS_LLM_MODEL` | `auto` | 背景學習／評判用模型 |
-| `ANTHROPIC_PROXY_SKILLS_API_KEY` | – | 非請求觸發的背景呼叫用 key(否則回退到最近一次 client key) |
+| `ANTHROPIC_PROXY_SKILLS_API_KEY` | – | 背景呼叫(distil／verify／proactive)專用 key。`…_LLM_URL` 有設時會送給它(不論觸發的是哪個 client,統一用這把);否則用於上游 fallback 認證。未設則回退到最近一次 client key |
 | `ANTHROPIC_PROXY_SKILLS_TOP_K` | `3` | 每次請求最多注入幾筆 |
 | `ANTHROPIC_PROXY_SKILLS_MIN_SCORE` | `0.5` | 注入的最低 cosine 分數(過濾弱匹配;bge-m3 建議約 `0.45`) |
 | `ANTHROPIC_PROXY_SKILLS_INJECT_TIERS` | `verified,trusted` | 可被注入的層級(排除 candidate) |
@@ -354,9 +354,11 @@ jq -r 'select(.ev=="promote")|"\(.tier)\t\(.title)"' skills-events-*.jsonl      
       ANTHROPIC_PROXY_SKILLS_QDRANT_URL: "http://qdrant:6333"
       ANTHROPIC_PROXY_SKILLS_EMBED_URL: "http://embeddings:8080/v1/embeddings"
       ANTHROPIC_PROXY_SKILLS_EMBED_MODEL: "bge-m3"
+      # 背景學習 LLM:免認證內部 backend(最省),或需認證/計費的上游 + 專用 key 分開計帳(取消下方註解)
       ANTHROPIC_PROXY_SKILLS_LLM_URL: "http://your-backend:8000/v1/chat/completions"
       ANTHROPIC_PROXY_SKILLS_LLM_MODEL: "your-model"
-      ANTHROPIC_PROXY_SKILLS_MIN_SCORE: "0.45"
+      # ANTHROPIC_PROXY_SKILLS_API_KEY: "sk-..."  # LLM_URL 與此都設定時,會送給 LLM_URL
+      ANTHROPIC_PROXY_SKILLS_MIN_SCORE: "0.45"    # bge-m3 的 cosine 分數偏壓縮
 ```
 
 ## 支援功能
