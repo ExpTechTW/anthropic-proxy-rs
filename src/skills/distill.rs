@@ -61,7 +61,7 @@ pub fn maybe_spawn(
     if transcript.trim().is_empty() {
         return;
     }
-    tracing::info!(messages = n, "skills/distill: spawning");
+    tracing::debug!(messages = n, "skills/distill: spawning");
     tokio::spawn(async move {
         distill(&config, &client, &transcript, api_key.as_deref()).await;
     });
@@ -100,7 +100,7 @@ transferable knowledge. Output STRICT JSON only, no prose: \
 
 async fn distill(config: &Config, client: &Client, transcript: &str, api_key: Option<&str>) {
     let user = format!("Transcript:\n{transcript}\n\nReturn the JSON now.");
-    tracing::info!(transcript_len = transcript.len(), "skills/distill: judging");
+    tracing::debug!(transcript_len = transcript.len(), "skills/distill: judging");
     let Some(value) =
         llm::chat_json(config, client, JUDGE_SYSTEM, &user, api_key, JUDGE_MAX_TOKENS).await
     else {
