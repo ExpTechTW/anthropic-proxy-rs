@@ -8,7 +8,6 @@
 
 use super::{embed, llm, store};
 use crate::config::Config;
-use crate::websearch::WebSearchClient;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -129,11 +128,7 @@ task-specific details. Output STRICT JSON only, no prose: \
 {\"title\":\"\",\"when_to_use\":\"short trigger phrase\",\"body\":\"actionable, general lesson\"}";
 
 async fn research(config: &Config, client: &Client, question: &str) -> Option<Lesson> {
-    let ws = WebSearchClient::new(config.websearch_url.clone(), client.clone());
-    let results = ws
-        .search(question, 5, &["duckduckgo".to_string()], "request")
-        .await
-        .ok()?;
+    let results = super::web_search(config, client, question, 5).await.ok()?;
     if results.is_empty() {
         return None;
     }

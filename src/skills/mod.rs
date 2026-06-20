@@ -75,6 +75,33 @@ pub fn background_api_key(config: &Config) -> Option<String> {
         .or_else(|| remembered_key().lock().unwrap().clone())
 }
 
+/// Web search for the learning loops (verify corroboration, proactive research). Prefers a
+/// configured SearXNG instance (reliable, 70+ engines, deduped) and falls back to open-websearch.
+/// The corroboration source must be reliable: when it errors, `verify` returns a transient `None`
+/// and the candidate is retried forever without a verdict — flaky DuckDuckGo scraping otherwise
+/// strands candidates in the `candidate` tier (never promoted, never injectable).
+pub(crate) async fn web_search(
+    config: &Config,
+    client: &Client,
+    query: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<crate::websearch::SearchResult>> {
+    if let Some(url) = &config.searxng_url {
+        match crate::searx::SearxClient::new(url.clone(), client.clone())
+            .search(query, limit)
+            .await
+        {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                tracing::debug!("skills/web_search: searxng failed ({e}); falling back to open-websearch")
+            }
+        }
+    }
+    crate::websearch::WebSearchClient::new(config.websearch_url.clone(), client.clone())
+        .search(query, limit, &["duckduckgo".to_string()], "request")
+        .await
+}
+
 /// A skill chosen for injection, carrying what we need to render it and report it back.
 #[derive(Debug, Clone)]
 pub struct RetrievedSkill {

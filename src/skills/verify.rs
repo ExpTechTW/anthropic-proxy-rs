@@ -10,7 +10,6 @@
 
 use super::{llm, store};
 use crate::config::Config;
-use crate::websearch::WebSearchClient;
 use futures::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
@@ -128,8 +127,7 @@ async fn verify(config: &Config, client: &Client, p: &store::SkillPayload) -> Op
     } else {
         format!("{} {}", p.title, p.when_to_use)
     };
-    let ws = WebSearchClient::new(config.websearch_url.clone(), client.clone());
-    let results = match ws.search(&query, 5, &["duckduckgo".to_string()], "request").await {
+    let results = match super::web_search(config, client, &query, 5).await {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!("skills/verify: search failed: {e}");
