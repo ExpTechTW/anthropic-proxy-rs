@@ -335,6 +335,7 @@ Everything is non-parametric — "learning" is writing rows to Qdrant — and ev
 | `ANTHROPIC_PROXY_SKILLS_EVENTLOG_RETENTION_DAYS` | `7` | Days to retain event-log entries |
 | `ANTHROPIC_PROXY_SKILLS_TOOLS` | `false` | Inject `recall_skills` + `search_docs` as tools the model can call. **Requests then buffer through a tool loop — no token streaming.** |
 | `ANTHROPIC_PROXY_SKILLS_DOCS_MCP_URL` | – | docs-mcp MCP endpoint for `search_docs` (self-hosted [docs-mcp-server](https://github.com/arabold/docs-mcp-server)) |
+| `ANTHROPIC_PROXY_SKILLS_DOCS_INJECT` | `false` | **Push**-inject docs for indexed libraries named in the query (streaming-preserving alternative to the tool loop; needs `DOCS_MCP_URL`) |
 
 > **Safety.** Learning from the open web is a documented poisoning vector, so the trust gate is the load-bearing control: unverified knowledge is never injected, promotion requires independent multi-source corroboration rather than the model's confidence, and the web-reading LLM is quarantined (no tools / no write access). Treat your embeddings / LLM / Qdrant endpoints as trusted infrastructure.
 
@@ -352,7 +353,7 @@ jq -r 'select(.ev=="promote")|"\(.tier)\t\(.title)"' skills-events-*.jsonl      
 - `recall_skills(query)` — query the learned-skill store.
 - `search_docs(library, query)` — query a self-hosted **[docs-mcp-server](https://github.com/arabold/docs-mcp-server)** (`ANTHROPIC_PROXY_SKILLS_DOCS_MCP_URL`) for up-to-date, version-specific library docs (an open-source, self-hostable Context7 alternative; point its embeddings at the same endpoint via `OPENAI_API_BASE` + `DOCS_MCP_EMBEDDING_MODEL`). This suits large reference docs better than push-injection, which is best kept for small learned lessons.
 
-**Caveat:** with tools enabled, requests run through a buffered tool loop, so they lose token-by-token streaming (heartbeats keep the connection alive) — the same tradeoff as the web-search agent.
+**Caveat:** with tools enabled, requests run through a buffered tool loop, so they lose token-by-token streaming (heartbeats keep the connection alive) — the same tradeoff as the web-search agent. **To keep streaming**, use **push-injection** instead: skills are always push-injected, and `ANTHROPIC_PROXY_SKILLS_DOCS_INJECT=1` push-injects a docs snippet for any indexed library named in the query — both as system blocks before forwarding, so the response still streams. Push is best for small content (lessons, focused doc snippets); the pull tools give the model precise on-demand control at the cost of streaming.
 
 Example (Docker Compose) — co-located Qdrant + a llama.cpp embedding server, with learning routed at a no-auth internal backend:
 

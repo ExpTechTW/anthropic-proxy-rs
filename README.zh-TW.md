@@ -311,6 +311,7 @@ tail -f /tmp/anthropic-proxy.log    # 日誌
 | `ANTHROPIC_PROXY_SKILLS_EVENTLOG_RETENTION_DAYS` | `7` | 事件記錄保留天數 |
 | `ANTHROPIC_PROXY_SKILLS_TOOLS` | `false` | 注入 `recall_skills` + `search_docs` 讓模型呼叫。**開啟後請求會走 buffer 迴圈、失去逐字串流。** |
 | `ANTHROPIC_PROXY_SKILLS_DOCS_MCP_URL` | – | `search_docs` 用的 docs-mcp MCP 端點(自架 [docs-mcp-server](https://github.com/arabold/docs-mcp-server)) |
+| `ANTHROPIC_PROXY_SKILLS_DOCS_INJECT` | `false` | **push** 注入查詢提到的已索引函式庫文件(保留串流,工具迴圈的替代;需 `DOCS_MCP_URL`) |
 
 > **安全。** 從開放網路學習是已知的中毒風險,所以信任分層是承重控制:未驗證知識絕不注入、升級需多個獨立來源佐證(而非模型自信)、讀網頁的 LLM 被隔離(無工具／無寫入)。請把你的 embeddings／LLM／Qdrant 端點視為可信基礎設施。
 
@@ -328,7 +329,7 @@ jq -r 'select(.ev=="promote")|"\(.tier)\t\(.title)"' skills-events-*.jsonl      
 - `recall_skills(query)` — 查學習到的技能庫。
 - `search_docs(library, query)` — 查自架的 **[docs-mcp-server](https://github.com/arabold/docs-mcp-server)**(`ANTHROPIC_PROXY_SKILLS_DOCS_MCP_URL`)取得最新、版本對應的函式庫文件(開源、可自架的 Context7 替代品;用 `OPENAI_API_BASE` + `DOCS_MCP_EMBEDDING_MODEL` 把它的 embedding 指向同一個端點)。大份文件用 pull 比 push 注入更合適,push 留給小份的學習教訓。
 
-**注意:** 開啟工具後,請求會走 buffer 迴圈,失去逐字串流(用 heartbeat 撐著)——跟 web_search agent 同樣的取捨。
+**注意:** 開啟工具後,請求會走 buffer 迴圈,失去逐字串流(用 heartbeat 撐著)——跟 web_search agent 同樣的取捨。**想保留串流**就改用 **push 注入**:skills 一律 push 注入,`ANTHROPIC_PROXY_SKILLS_DOCS_INJECT=1` 則把查詢提到的已索引函式庫文件片段 push 注入——都在轉發前以 system block 加入,回應照樣串流。push 適合小份內容(教訓、聚焦的文件片段);pull 工具給模型精準的按需控制,代價是失去串流。
 
 範例(Docker Compose)— 同址 Qdrant + llama.cpp embedding server,學習導向免認證的內部 backend:
 
