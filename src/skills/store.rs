@@ -23,11 +23,15 @@ const QDRANT_TIMEOUT: Duration = Duration::from_secs(15);
 /// (provenance, timestamps, usage counters added by later stages) are ignored here.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SkillPayload {
+    // Filtering on `tier` happens Qdrant-side, and `when_to_use` is used by later-stage
+    // ranking/curation, so neither is read here yet — keep them as the documented schema.
     #[serde(default)]
+    #[allow(dead_code)]
     pub tier: String,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub when_to_use: String,
     #[serde(default)]
     pub body: String,
