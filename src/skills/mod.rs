@@ -17,10 +17,12 @@ mod distill;
 mod embed;
 mod llm;
 mod store;
+mod verify;
 
 #[allow(unused_imports)]
 pub use store::{stable_id, QdrantClient};
 pub use distill::maybe_spawn as maybe_spawn_distill;
+pub use verify::spawn as spawn_verify;
 
 use crate::config::Config;
 use crate::models::anthropic;

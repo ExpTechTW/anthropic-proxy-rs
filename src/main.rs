@@ -203,6 +203,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     let config = Arc::new(config);
 
+    // Stage 3: background verification/promotion loop (no-op unless skills learning is enabled).
+    skills::spawn_verify(config.clone(), client.clone());
+
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)

@@ -71,6 +71,10 @@ pub struct SkillsConfig {
     /// (e.g. a no-auth internal backend), so background tasks need no client key; unset uses the
     /// authed upstream + client key.
     pub llm_url: Option<String>,
+    /// How often the verification/promotion loop runs (seconds).
+    pub verify_interval_secs: u64,
+    /// How long a `verified` entry must soak before it can become `trusted` (seconds).
+    pub soak_secs: u64,
 }
 
 impl Default for SkillsConfig {
@@ -89,6 +93,8 @@ impl Default for SkillsConfig {
             api_key: None,
             retention_days: 30,
             llm_url: None,
+            verify_interval_secs: 300,
+            soak_secs: 14 * 24 * 60 * 60,
         }
     }
 }
@@ -156,6 +162,14 @@ impl SkillsConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        let verify_interval_secs = env::var("ANTHROPIC_PROXY_SKILLS_VERIFY_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d.verify_interval_secs);
+        let soak_secs = env::var("ANTHROPIC_PROXY_SKILLS_SOAK_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d.soak_secs);
         SkillsConfig {
             enabled,
             qdrant_url,
@@ -170,6 +184,8 @@ impl SkillsConfig {
             api_key,
             retention_days,
             llm_url,
+            verify_interval_secs,
+            soak_secs,
         }
     }
 }

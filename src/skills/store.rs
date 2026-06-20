@@ -23,18 +23,21 @@ const QDRANT_TIMEOUT: Duration = Duration::from_secs(15);
 /// (provenance, timestamps, usage counters added by later stages) are ignored here.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SkillPayload {
-    // Filtering on `tier` happens Qdrant-side, and `when_to_use` is used by later-stage
-    // ranking/curation, so neither is read here yet — keep them as the documented schema.
     #[serde(default)]
-    #[allow(dead_code)]
     pub tier: String,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
-    #[allow(dead_code)]
     pub when_to_use: String,
     #[serde(default)]
     pub body: String,
+    /// When the entry was promoted to `verified` (unix secs) — drives the soak before `trusted`.
+    #[serde(default)]
+    pub verified_at: Option<u64>,
+    /// When the entry was first written (unix secs) — drives retention/decay (Stage 4).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub created_at: Option<u64>,
 }
 
 /// One search hit: the point id (as a string, whether Qdrant returned an int or uuid), its
@@ -59,6 +62,33 @@ struct RawPoint {
     score: f32,
     #[serde(default)]
     payload: SkillPayload,
+}
+
+#[derive(Deserialize)]
+struct ScrollResponse {
+    result: ScrollResult,
+}
+
+#[derive(Deserialize)]
+struct ScrollResult {
+    #[serde(default)]
+    points: Vec<ScrollPoint>,
+}
+
+#[derive(Deserialize)]
+struct ScrollPoint {
+    id: Value,
+    #[serde(default)]
+    payload: SkillPayload,
+}
+
+/// Decode a Qdrant point id (we always write u64 ids) back to u64.
+fn id_as_u64(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
 }
 
 /// A client bound to one Qdrant base URL + collection.
@@ -126,6 +156,62 @@ impl QdrantClient {
                     payload: p.payload,
                 })
                 .collect(),
+        )
+    }
+
+    /// Scroll up to `limit` points in one tier (no vectors). Used by the verify/curate loops.
+    /// Best-effort: empty on failure (e.g. collection not yet created).
+    pub async fn scroll_tier(&self, tier: &str, limit: u32) -> Vec<(u64, SkillPayload)> {
+        let url = format!("{}/collections/{}/points/scroll", self.base, self.collection);
+        let body = json!({
+            "limit": limit,
+            "with_payload": true,
+            "with_vector": false,
+            "filter": { "must": [ { "key": "tier", "match": { "value": tier } } ] },
+        });
+        let Ok(resp) = self
+            .http
+            .post(&url)
+            .timeout(QDRANT_TIMEOUT)
+            .json(&body)
+            .send()
+            .await
+        else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(parsed) = resp.json::<ScrollResponse>().await else {
+            return Vec::new();
+        };
+        parsed
+            .result
+            .points
+            .into_iter()
+            .filter_map(|p| id_as_u64(&p.id).map(|id| (id, p.payload)))
+            .collect()
+    }
+
+    /// Merge `fields` into a point's payload (Qdrant set_payload) without touching its vector —
+    /// used to change `tier` and stamp verification metadata.
+    pub async fn set_payload(&self, id: u64, fields: Value) -> bool {
+        let url = format!("{}/collections/{}/points/payload?wait=true", self.base, self.collection);
+        let body = json!({ "payload": fields, "points": [id] });
+        matches!(
+            self.http.post(&url).timeout(QDRANT_TIMEOUT).json(&body).send().await,
+            Ok(r) if r.status().is_success()
+        )
+    }
+
+    /// Delete one point by id (used by curation/retention).
+    #[allow(dead_code)]
+    pub async fn delete(&self, id: u64) -> bool {
+        let url = format!("{}/collections/{}/points/delete?wait=true", self.base, self.collection);
+        let body = json!({ "points": [id] });
+        matches!(
+            self.http.post(&url).timeout(QDRANT_TIMEOUT).json(&body).send().await,
+            Ok(r) if r.status().is_success()
         )
     }
 
