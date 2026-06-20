@@ -115,7 +115,9 @@ async fn run_once(config: &Config, client: &Client) {
     let mut promoted = qc.scroll_tier("verified", SCROLL_BATCH).await;
     promoted.extend(qc.scroll_tier("trusted", SCROLL_BATCH).await);
     for (id, p) in promoted {
-        let last = p.reverified_at.or(p.verified_at).unwrap_or(now);
+        // Fall back to created_at so legacy skills missing verified_at (which would otherwise
+        // default to "now" and never re-check) still age into re-verification.
+        let last = p.reverified_at.or(p.verified_at).or(p.created_at).unwrap_or(now);
         if now.saturating_sub(last) < due {
             continue; // not due for re-check yet
         }
