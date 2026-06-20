@@ -1,0 +1,69 @@
+# Example: anthropic-proxy with the full self-learning skills stack —
+#   Qdrant (skill store) + llama.cpp embeddings + self-hosted docs-mcp (library docs).
+# Adjust UPSTREAM_BASE_URL, the model names, and SKILLS_LLM_URL to your own backend.
+#
+#   docker compose -f docker-compose.skills.yml up -d
+#
+# See README.md → "Self-learning skills" for what each variable does.
+
+services:
+  qdrant:
+    image: qdrant/qdrant
+    restart: always
+    volumes:
+      - ./qdrant-data:/qdrant/storage
+
+  # OpenAI-compatible /v1/embeddings — multilingual bge-m3, on CPU. -ub 8192 lets it embed long
+  # inputs in one physical batch (otherwise llama.cpp 500s on inputs over the default 512 tokens).
+  embeddings:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    restart: always
+    command: ["-hf","gpustack/bge-m3-GGUF:Q4_K_M","--embeddings","--pooling","cls",
+              "-c","8192","-ub","8192","--host","0.0.0.0","--port","8080"]
+    volumes:
+      - ./llama-cache:/root/.cache/llama.cpp
+
+  # Self-hosted up-to-date library docs (open-source Context7 alternative). Indexes docs with the
+  # same embeddings endpoint. Web UI on :6280 — bound to localhost; reach it via an SSH tunnel:
+  #   ssh -L 6280:localhost:6280 user@host   then open http://localhost:6280
+  docs-mcp:
+    image: ghcr.io/arabold/docs-mcp-server:latest
+    restart: always
+    user: root                       # so it can write its SQLite store to the mounted volume
+    command: ["--protocol","http","--host","0.0.0.0","--port","6280"]
+    environment:
+      OPENAI_API_BASE: "http://embeddings:8080/v1"
+      OPENAI_API_KEY: "local"        # dummy — the endpoint needs no auth
+      DOCS_MCP_EMBEDDING_MODEL: "openai:bge-m3"
+    ports:
+      - "127.0.0.1:6280:6280"
+    volumes:
+      - ./docs-mcp-data:/data
+
+  anthropic-proxy:
+    image: anthropic-proxy           # build per README → Download / Docker
+    restart: always
+    depends_on: [qdrant, embeddings, docs-mcp]
+    ports:
+      - "3000:3000"
+    environment:
+      UPSTREAM_BASE_URL: "http://your-openai-compatible-upstream/v1"
+      # --- learn from conversations + inject relevant skills (push; streaming preserved) ---
+      ANTHROPIC_PROXY_SKILLS_ENABLED: "true"
+      ANTHROPIC_PROXY_SKILLS_LEARN: "true"
+      ANTHROPIC_PROXY_SKILLS_PROACTIVE: "true"
+      ANTHROPIC_PROXY_SKILLS_QDRANT_URL: "http://qdrant:6333"
+      ANTHROPIC_PROXY_SKILLS_EMBED_URL: "http://embeddings:8080/v1/embeddings"
+      ANTHROPIC_PROXY_SKILLS_EMBED_MODEL: "bge-m3"
+      ANTHROPIC_PROXY_SKILLS_MIN_SCORE: "0.45"     # bge-m3 cosine is compressed
+      # background learning LLM — point at a no-auth internal backend to avoid spending a client key
+      ANTHROPIC_PROXY_SKILLS_LLM_URL: "http://your-backend/v1/chat/completions"
+      ANTHROPIC_PROXY_SKILLS_LLM_MODEL: "your-model"
+      # docs: push-inject for libraries named in the query (streaming preserved).
+      # Prefer this over the pull tool loop (ANTHROPIC_PROXY_SKILLS_TOOLS=true), which buffers.
+      ANTHROPIC_PROXY_SKILLS_DOCS_MCP_URL: "http://docs-mcp:6280/mcp"
+      ANTHROPIC_PROXY_SKILLS_DOCS_INJECT: "true"
+      # compact, persistent learning-event log (daily files, pruned to 7 days)
+      ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH: "/data/skills-events.jsonl"
+    volumes:
+      - ./skills-data:/data

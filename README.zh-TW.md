@@ -331,6 +331,12 @@ jq -r 'select(.ev=="promote")|"\(.tier)\t\(.title)"' skills-events-*.jsonl      
 
 **注意:** 開啟工具後,請求會走 buffer 迴圈,失去逐字串流(用 heartbeat 撐著)——跟 web_search agent 同樣的取捨。**想保留串流**就改用 **push 注入**:skills 一律 push 注入,`ANTHROPIC_PROXY_SKILLS_DOCS_INJECT=1` 則把查詢提到的已索引函式庫文件片段 push 注入——都在轉發前以 system block 加入,回應照樣串流。push 適合小份內容(教訓、聚焦的文件片段);pull 工具給模型精準的按需控制,代價是失去串流。
 
+**完整範例 + 文件定時更新。** 完整的一套(proxy + Qdrant + embeddings + docs-mcp)在 [`examples/docker-compose.skills.yml`](examples/docker-compose.skills.yml)。docs-mcp 沒有內建排程,用 [`examples/refresh-docs.py`](examples/refresh-docs.py) 透過 cron 定時刷新已索引的函式庫,例如每天 04:00:
+
+```cron
+0 4 * * * /usr/bin/docker run --rm --network PROJECT_trem-net -v /home/USER/refresh-docs.py:/r.py:ro python:3-slim python /r.py >> /home/USER/docs-refresh.log 2>&1
+```
+
 範例(Docker Compose)— 同址 Qdrant + llama.cpp embedding server,學習導向免認證的內部 backend:
 
 ```yaml

@@ -355,6 +355,12 @@ jq -r 'select(.ev=="promote")|"\(.tier)\t\(.title)"' skills-events-*.jsonl      
 
 **Caveat:** with tools enabled, requests run through a buffered tool loop, so they lose token-by-token streaming (heartbeats keep the connection alive) — the same tradeoff as the web-search agent. **To keep streaming**, use **push-injection** instead: skills are always push-injected, and `ANTHROPIC_PROXY_SKILLS_DOCS_INJECT=1` push-injects a docs snippet for any indexed library named in the query — both as system blocks before forwarding, so the response still streams. Push is best for small content (lessons, focused doc snippets); the pull tools give the model precise on-demand control at the cost of streaming.
 
+**Full example + keeping docs fresh.** A complete stack (proxy + Qdrant + embeddings + docs-mcp) is in [`examples/docker-compose.skills.yml`](examples/docker-compose.skills.yml). docs-mcp has no built-in scheduler, so refresh indexed libraries from cron with [`examples/refresh-docs.py`](examples/refresh-docs.py) — e.g. daily at 04:00:
+
+```cron
+0 4 * * * /usr/bin/docker run --rm --network PROJECT_trem-net -v /home/USER/refresh-docs.py:/r.py:ro python:3-slim python /r.py >> /home/USER/docs-refresh.log 2>&1
+```
+
 Example (Docker Compose) — co-located Qdrant + a llama.cpp embedding server, with learning routed at a no-auth internal backend:
 
 ```yaml
