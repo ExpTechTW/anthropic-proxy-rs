@@ -23,7 +23,9 @@ const QDRANT_TIMEOUT: Duration = Duration::from_secs(15);
 /// (provenance, timestamps, usage counters added by later stages) are ignored here.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SkillPayload {
+    // Filtering on `tier` is done Qdrant-side (scroll/search), so the field isn't read in Rust.
     #[serde(default)]
+    #[allow(dead_code)]
     pub tier: String,
     #[serde(default)]
     pub title: String,
