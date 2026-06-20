@@ -18,7 +18,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const BUFFER_CAP: usize = 200;
 const PER_TICK: usize = 3; // research up to N questions per tick
 const MIN_QUESTION_LEN: usize = 12;
-const RESEARCH_MAX_TOKENS: u32 = 1024;
+// Generous: reasoning models spend ~1K+ tokens in `reasoning_content` before emitting the JSON
+// lesson into `content`; too small a budget truncates mid-thought → empty content → no candidate.
+const RESEARCH_MAX_TOKENS: u32 = 2048;
 
 fn buffer() -> &'static Mutex<VecDeque<String>> {
     static B: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();

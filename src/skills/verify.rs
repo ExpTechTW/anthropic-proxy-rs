@@ -20,7 +20,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const SCROLL_BATCH: u32 = 20;
 const MIN_DOMAINS: usize = 2; // independent corroborating hosts required to promote
 const MIN_CONFIDENCE: f32 = 0.6;
-const VERDICT_MAX_TOKENS: u32 = 512;
+// Generous budget: reasoning models (e.g. qwen3.6) emit chain-of-thought into `reasoning_content`
+// even with `/no_think`, and only THEN the JSON verdict into `content`. 512 was exhausted on
+// reasoning (finish_reason=length) → empty content → unparseable → verify stuck returning None
+// forever. ~2K leaves room to finish thinking and still output the short verdict.
+const VERDICT_MAX_TOKENS: u32 = 2048;
 /// Verify several candidates at once so the loop keeps up with aggressive learning, but kept
 /// modest so we don't overload the shared backend / search egress.
 const CONCURRENCY: usize = 3;

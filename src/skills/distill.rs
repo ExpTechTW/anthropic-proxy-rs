@@ -22,7 +22,9 @@ const MIN_MESSAGES: usize = 4; // need a real exchange, not a one-shot
 const DISTILL_STRIDE: usize = 6; // re-distil a growing thread only every N new messages
 const MAX_TRANSCRIPT_CHARS: usize = 12_000;
 const MAX_LESSONS: usize = 3;
-const JUDGE_MAX_TOKENS: u32 = 2048;
+// Room for the model's (often unsuppressed) reasoning_content PLUS up to 3 JSON lessons in
+// content — a tight budget truncates mid-thought and yields empty/invalid output.
+const JUDGE_MAX_TOKENS: u32 = 3072;
 
 /// Per-conversation throttle: signature -> message count at last distillation.
 fn tracker() -> &'static Mutex<HashMap<u64, usize>> {
