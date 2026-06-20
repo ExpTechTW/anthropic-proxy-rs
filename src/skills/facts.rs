@@ -19,11 +19,14 @@ use crate::config::Config;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const FACT_MAX_TOKENS: u32 = 2048;
 const MIN_DOMAINS: usize = 2; // independent corroborating hosts before we cache a value
 const MIN_CONFIDENCE: f32 = 0.6;
+const FACTS_SCROLL: u32 = 300;
+const DEFAULT_HALF_LIFE: u64 = 30 * 86_400;
 
 /// A cached fact, read back by the (later) freshness-weighted injection + validity loop.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -157,6 +160,62 @@ pub async fn maybe_learn_fact(config: &Config, client: &Client, question: &str) 
             "fact",
             json!({"subject": f.subject.clone(), "value": f.value.clone(), "volatility": f.volatility.clone()}),
         );
+    }
+}
+
+/// Start the fact validity/refresh loop: periodically re-check facts whose freshness has decayed
+/// (age past half the half-life) and re-research them — confirming (refresh timestamp), updating
+/// (belief revision, new value), or leaving them stamped for backoff. Search-bound, so it shares
+/// the global SearXNG rate-gate; the LLM side is unmetered. No-op unless learning + facts are on.
+pub fn spawn_validity(config: Arc<Config>, client: Client) {
+    if !config.skills.learn || !config.skills.facts {
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        let mut tick =
+            tokio::time::interval(Duration::from_secs(config.skills.facts_validity_interval_secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            run_validity(&config, &client).await;
+        }
+    });
+    tracing::info!("skills/facts: validity loop started");
+}
+
+async fn run_validity(config: &Config, client: &Client) {
+    let qc = store::QdrantClient::new(
+        config.skills.qdrant_url.clone(),
+        config.skills.facts_collection.clone(),
+        client.clone(),
+    );
+    let now = unix_now();
+    for (id, payload) in qc.scroll_payloads(FACTS_SCROLL).await {
+        let f: FactPayload = match serde_json::from_value(payload) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let observed = f.observed_at.unwrap_or(now);
+        let half = f.half_life_secs.unwrap_or(DEFAULT_HALF_LIFE);
+        // Re-check once freshness has decayed below ~0.6 (age past half the half-life).
+        if now.saturating_sub(observed) * 2 < half {
+            continue;
+        }
+        // Backoff so an un-confirmable fact isn't re-searched every tick.
+        if let Some(t) = f.verify_attempted_at {
+            if now.saturating_sub(t) < config.skills.verify_backoff_secs {
+                continue;
+            }
+        }
+        // Stamp the attempt first; a successful re-research overwrites the whole payload with a
+        // fresh observed_at (clearing this), a failed one leaves it set so we back off.
+        qc.set_payload(id, json!({ "verify_attempted_at": now })).await;
+        if f.subject.trim().is_empty() {
+            continue;
+        }
+        tracing::debug!(subject = %f.subject, "skills/facts: re-checking stale fact");
+        maybe_learn_fact(config, client, &f.subject).await;
     }
 }
 

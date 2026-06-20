@@ -108,6 +108,24 @@ struct ScrollVecPoint {
     vector: Option<Vec<f32>>,
 }
 
+#[derive(Deserialize)]
+struct RawScrollResponse {
+    result: RawScrollResult,
+}
+
+#[derive(Deserialize)]
+struct RawScrollResult {
+    #[serde(default)]
+    points: Vec<RawScrollPoint>,
+}
+
+#[derive(Deserialize)]
+struct RawScrollPoint {
+    id: Value,
+    #[serde(default)]
+    payload: Value,
+}
+
 /// Decode a Qdrant point id (we always write u64 ids) back to u64.
 fn id_as_u64(v: &Value) -> Option<u64> {
     match v {
@@ -260,6 +278,35 @@ impl QdrantClient {
                 let vector = p.vector?;
                 Some((id, p.payload, vector))
             })
+            .collect()
+    }
+
+    /// Scroll up to `limit` points returning raw payloads as JSON Values — for collections with a
+    /// different payload shape than `SkillPayload` (e.g. the facts store). Best-effort: empty on failure.
+    pub async fn scroll_payloads(&self, limit: u32) -> Vec<(u64, Value)> {
+        let url = format!("{}/collections/{}/points/scroll", self.base, self.collection);
+        let body = json!({ "limit": limit, "with_payload": true, "with_vector": false });
+        let Ok(resp) = self
+            .http
+            .post(&url)
+            .timeout(QDRANT_TIMEOUT)
+            .json(&body)
+            .send()
+            .await
+        else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(parsed) = resp.json::<RawScrollResponse>().await else {
+            return Vec::new();
+        };
+        parsed
+            .result
+            .points
+            .into_iter()
+            .filter_map(|p| id_as_u64(&p.id).map(|id| (id, p.payload)))
             .collect()
     }
 

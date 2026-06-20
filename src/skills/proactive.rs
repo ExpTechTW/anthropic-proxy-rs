@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BUFFER_CAP: usize = 200;
-const PER_TICK: usize = 3; // research up to N questions per tick
+const PER_TICK: usize = 6; // research up to N questions per tick (search-bound work queues at the rate-gate)
 const MIN_QUESTION_LEN: usize = 12;
 // Generous: reasoning models spend ~1K+ tokens in `reasoning_content` before emitting the JSON
 // lesson into `content`; too small a budget truncates mid-thought → empty content → no candidate.

@@ -95,6 +95,8 @@ pub struct SkillsConfig {
     pub facts: bool,
     /// How often the proactive-learning loop runs (seconds).
     pub proactive_interval_secs: u64,
+    /// How often the facts validity loop re-checks decayed facts (seconds).
+    pub facts_validity_interval_secs: u64,
     /// Path to a compact JSONL learning-event log (empty disables it). Persist via a volume.
     pub eventlog_path: String,
     /// Days to retain learning-event log entries.
@@ -133,6 +135,7 @@ impl Default for SkillsConfig {
             proactive: false,
             facts: false,
             proactive_interval_secs: 600,
+            facts_validity_interval_secs: 1800,
             eventlog_path: String::new(),
             eventlog_retention_days: 7,
             tools: false,
@@ -236,6 +239,10 @@ impl SkillsConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(d.proactive_interval_secs);
+        let facts_validity_interval_secs = env::var("ANTHROPIC_PROXY_SKILLS_FACTS_VALIDITY_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d.facts_validity_interval_secs);
         let eventlog_path = env::var("ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH")
             .ok()
             .map(|v| v.trim().to_string())
@@ -276,6 +283,7 @@ impl SkillsConfig {
             facts,
             facts_collection,
             proactive_interval_secs,
+            facts_validity_interval_secs,
             eventlog_path,
             eventlog_retention_days,
             tools,

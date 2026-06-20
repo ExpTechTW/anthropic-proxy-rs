@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MIN_MESSAGES: usize = 4; // need a real exchange, not a one-shot
-const DISTILL_STRIDE: usize = 6; // re-distil a growing thread only every N new messages
+const DISTILL_STRIDE: usize = 3; // re-distil a growing thread every N new messages (LLM is unmetered)
 const MAX_TRANSCRIPT_CHARS: usize = 12_000;
 const MAX_LESSONS: usize = 3;
 // Room for the model's (often unsuppressed) reasoning_content PLUS up to 3 JSON lessons in

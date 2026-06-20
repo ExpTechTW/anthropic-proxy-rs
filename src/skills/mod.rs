@@ -36,6 +36,7 @@ pub use distill::maybe_spawn as maybe_spawn_distill;
 pub use verify::spawn as spawn_verify;
 pub use curate::spawn as spawn_curate;
 pub use proactive::{record_question, spawn as spawn_proactive};
+pub use facts::spawn_validity as spawn_facts_validity;
 pub use eventlog::record as log_event;
 
 /// Start the compact learning-event log (no-op unless `ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH` set).
@@ -50,6 +51,34 @@ use crate::config::Config;
 use crate::models::anthropic;
 use reqwest::Client;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// Global minimum gap between background web searches. The LLM (vllm) is unmetered, but SearXNG is
+/// the real constraint: each search fans out to ~20 engines and the strict ones (Brave/DuckDuckGo/
+/// Startpage) CAPTCHA and get suspended under load. Serializing background searches to a sustainable
+/// rate keeps the engine pool healthy (paced 2s-apart searches return full results) while the
+/// aggressive learning loops queue here instead of hammering it.
+const SEARCH_MIN_GAP: Duration = Duration::from_millis(2000);
+
+/// Reserve the next search slot (≥ `SEARCH_MIN_GAP` after the previous) and return how long to wait
+/// for it. Lock is held only for the arithmetic (never across the await), so callers queue fairly.
+async fn search_gate() {
+    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    let now = Instant::now();
+    let slot = {
+        let mut last = LAST.get_or_init(|| Mutex::new(None)).lock().unwrap();
+        let slot = match *last {
+            Some(prev) => (prev + SEARCH_MIN_GAP).max(now),
+            None => now,
+        };
+        *last = Some(slot);
+        slot
+    };
+    let delay = slot.checked_duration_since(now).unwrap_or(Duration::ZERO);
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+}
 
 /// Remember the most recent non-empty client API key so background learning loops (which run off
 /// the request path and have no client key) can still call the upstream in passthrough mode.
@@ -87,6 +116,7 @@ pub(crate) async fn web_search(
     query: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<crate::websearch::SearchResult>> {
+    search_gate().await; // throttle: SearXNG is the bottleneck, not the (unmetered) LLM
     if let Some(url) = &config.searxng_url {
         match crate::searx::SearxClient::new(url.clone(), client.clone())
             .search(query, limit)
