@@ -301,7 +301,7 @@ An optional, default-off layer that lets the proxy **learn reusable lessons from
 
 Knowledge lives in an external **[Qdrant](https://qdrant.tech)** vector store (no model fine-tuning), and every entry carries a **trust tier** — only `verified`/`trusted` ones are ever injected. The pipeline:
 
-1. **Inject** *(on the request path)* — embed the user's latest message, retrieve the top-k most relevant `verified`/`trusted` skills, and append them as a system block. Injected skill ids are surfaced in an `x-injected-skills` response header.
+1. **Inject** *(on the request path)* — embed the user's latest message, retrieve the top-k most relevant `verified`/`trusted` skills, and append them as a system block. Injected skill ids are surfaced in an `x-injected-skills` response header. Injection is **on by default** when the feature is enabled; a client can opt a single request out with the request header **`x-skills-inject: off`** (also `false`/`0`/`no`).
 2. **Distil** *(background)* — after a conversation, an LLM judge labels the outcome (success/failure, strict: absence of a complaint is **not** success) and extracts ≤3 general, reusable lessons (learning from both success and failure), written as `candidate` — never injectable.
 3. **Verify** *(background loop)* — each candidate is corroborated against the open web by a *quarantined* reader (treats results as untrusted data, no tools); promotion to `verified` requires a positive verdict **and** independent multi-source corroboration (not the model's own confidence), then to `trusted` after a soak period.
 4. **Curate** *(background loop)* — drop unverified candidates past the retention window and collapse near-duplicate entries, keeping the store small and high-signal.

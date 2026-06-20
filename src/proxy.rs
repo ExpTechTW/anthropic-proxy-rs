@@ -35,9 +35,10 @@ pub async fn proxy_handler(
         skills::record_question(&user_text);
     }
 
-    // Auto-inject relevant learned skills (Stage 1). Best-effort: embedding/Qdrant failures
-    // return no skills and the request proceeds untouched, so the feature can never break a call.
-    let injected_skills = if config.skills.enabled {
+    // Auto-inject relevant learned skills (Stage 1). On by default when the feature is enabled;
+    // a client can opt one request out with `x-skills-inject: off`. Best-effort: embedding/Qdrant
+    // failures return no skills and the request proceeds untouched, so it can never break a call.
+    let injected_skills = if config.skills.enabled && !skills_inject_disabled(&headers) {
         let found = skills::retrieve(&config, &client, &user_text, api_key.as_deref()).await;
         let ids = skills::inject(&mut req, &found);
         if !ids.is_empty() {
@@ -492,6 +493,22 @@ pub async fn list_models_handler(
     Err(ProxyError::Upstream(
         last_err.unwrap_or_else(|| "All upstreams failed".to_string()),
     ))
+}
+
+/// Whether a request opted out of skill injection via `x-skills-inject`. Injection is ON by
+/// default (header absent or any non-falsy value); a falsy value (`off`/`false`/`0`/`no`/`disable`)
+/// disables it for that one request.
+fn skills_inject_disabled(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-skills-inject")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "off" | "false" | "0" | "no" | "disable" | "disabled"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn resolve_api_key(config: &Config, headers: &HeaderMap) -> Option<String> {
@@ -1164,6 +1181,28 @@ mod tests {
             axum::http::HeaderValue::from_str(value).unwrap(),
         );
         headers
+    }
+
+    #[test]
+    fn skills_inject_disabled_only_on_falsy_header() {
+        let with = |v: &str| {
+            let mut m = HeaderMap::new();
+            m.insert(
+                axum::http::header::HeaderName::from_static("x-skills-inject"),
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+            m
+        };
+        // Default (no header) keeps injection on.
+        assert!(!super::skills_inject_disabled(&HeaderMap::new()));
+        // Falsy values disable it (case- and whitespace-insensitive).
+        for v in ["off", "false", "0", "no", "disable", "disabled", "OFF", " Off "] {
+            assert!(super::skills_inject_disabled(&with(v)), "{v:?} should disable");
+        }
+        // Anything else leaves injection on.
+        for v in ["on", "true", "1", "yes", "enabled", "whatever"] {
+            assert!(!super::skills_inject_disabled(&with(v)), "{v:?} should not disable");
+        }
     }
 
     #[test]

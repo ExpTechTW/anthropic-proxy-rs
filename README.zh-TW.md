@@ -277,7 +277,7 @@ tail -f /tmp/anthropic-proxy.log    # 日誌
 
 知識存在外部 **[Qdrant](https://qdrant.tech)** 向量庫(不需 fine-tune),每筆都帶**信任分層**——只有 `verified`/`trusted` 會被注入。流程:
 
-1. **注入**(請求路徑上)— 把使用者最後一則訊息做 embedding,取出最相關的前 k 筆 `verified`/`trusted` 技能,以 system block 附加;注入的技能 id 會回在 `x-injected-skills` 標頭。
+1. **注入**(請求路徑上)— 把使用者最後一則訊息做 embedding,取出最相關的前 k 筆 `verified`/`trusted` 技能,以 system block 附加;注入的技能 id 會回在 `x-injected-skills` 標頭。功能開啟時**預設注入**;client 可用請求標頭 **`x-skills-inject: off`**(或 `false`/`0`/`no`)對單一請求關閉。
 2. **蒸餾**(背景)— 對話後由 LLM 評判結果(成功/失敗,從嚴:沒有抱怨**不等於**成功),萃取 ≤3 條通用、可重用的教訓(成功與失敗都學),寫成 `candidate`(不可注入)。
 3. **驗證**(背景迴圈)— 每個 candidate 由**隔離的**讀取器(把搜尋結果當不可信資料、無工具)對開放網路查證;升級為 `verified` 需要正面判定**且**多個獨立來源佐證(而非模型自信),再經 soak 期升 `trusted`。
 4. **策展**(背景迴圈)— 淘汰過保留期的未驗證 candidate、合併近似重複,使知識庫精簡高訊號。
