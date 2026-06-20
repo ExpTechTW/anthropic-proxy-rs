@@ -336,13 +336,13 @@ Everything is non-parametric — "learning" is writing rows to Qdrant — and ev
 
 > **Safety.** Learning from the open web is a documented poisoning vector, so the trust gate is the load-bearing control: unverified knowledge is never injected, promotion requires independent multi-source corroboration rather than the model's confidence, and the web-reading LLM is quarantined (no tools / no write access). Treat your embeddings / LLM / Qdrant endpoints as trusted infrastructure.
 
-**Analysing the learning.** Set `ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH` to record a compact JSONL trail of the learning funnel — one small line per `inject` / `distill` / `promote` / `reject` / `curate` / `proactive` event, off the request path and pruned to `…_EVENTLOG_RETENTION_DAYS` (default 7). Analyse with `jq`:
+**Analysing the learning.** Set `ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH` to record a compact JSONL trail of the learning funnel — one small line per `inject` / `distill` / `promote` / `reject` / `curate` / `proactive` event, off the request path. Files rotate daily (`<base>-YYYYMMDD.jsonl`, UTC) and pruning just deletes files older than `…_EVENTLOG_RETENTION_DAYS` (default 7). Analyse across days with a glob:
 
 ```bash
-jq -r .ev events.jsonl | sort | uniq -c                                            # funnel counts
-jq -r 'select(.ev=="distill")|.skills[]' events.jsonl                               # what was learned
-jq -r 'select(.ev=="inject")|.skills[]' events.jsonl | sort | uniq -c | sort -rn    # most-used skills
-jq -r 'select(.ev=="promote")|"\(.tier)\t\(.title)"' events.jsonl                   # promotions over time
+jq -r .ev skills-events-*.jsonl | sort | uniq -c                                            # funnel counts
+jq -r 'select(.ev=="distill")|.skills[]' skills-events-*.jsonl                               # what was learned
+jq -r 'select(.ev=="inject")|.skills[]' skills-events-*.jsonl | sort | uniq -c | sort -rn    # most-used skills
+jq -r 'select(.ev=="promote")|"\(.tier)\t\(.title)"' skills-events-*.jsonl                   # promotions over time
 ```
 
 Example (Docker Compose) — co-located Qdrant + a llama.cpp embedding server, with learning routed at a no-auth internal backend:

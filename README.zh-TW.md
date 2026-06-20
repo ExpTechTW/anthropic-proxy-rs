@@ -312,13 +312,13 @@ tail -f /tmp/anthropic-proxy.log    # 日誌
 
 > **安全。** 從開放網路學習是已知的中毒風險,所以信任分層是承重控制:未驗證知識絕不注入、升級需多個獨立來源佐證(而非模型自信)、讀網頁的 LLM 被隔離(無工具／無寫入)。請把你的 embeddings／LLM／Qdrant 端點視為可信基礎設施。
 
-**分析學習狀況。** 設 `ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH` 會記錄一份精簡 JSONL 學習漏斗軌跡——每個 `inject`／`distill`／`promote`／`reject`／`curate`／`proactive` 事件一行,在請求路徑外寫入,按 `…_EVENTLOG_RETENTION_DAYS`(預設 7 天)淘汰。用 `jq` 分析:
+**分析學習狀況。** 設 `ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH` 會記錄一份精簡 JSONL 學習漏斗軌跡——每個 `inject`／`distill`／`promote`／`reject`／`curate`／`proactive` 事件一行,在請求路徑外寫入。**按日分檔**(`<base>-YYYYMMDD.jsonl`,UTC),淘汰時直接刪掉超過 `…_EVENTLOG_RETENTION_DAYS`(預設 7 天)的舊檔。用 `jq` glob 跨天分析:
 
 ```bash
-jq -r .ev events.jsonl | sort | uniq -c                                            # 漏斗各階段數量
-jq -r 'select(.ev=="distill")|.skills[]' events.jsonl                               # 學到了什麼
-jq -r 'select(.ev=="inject")|.skills[]' events.jsonl | sort | uniq -c | sort -rn    # 最常被用到的技能
-jq -r 'select(.ev=="promote")|"\(.tier)\t\(.title)"' events.jsonl                   # 升級歷程
+jq -r .ev skills-events-*.jsonl | sort | uniq -c                                            # 漏斗各階段數量
+jq -r 'select(.ev=="distill")|.skills[]' skills-events-*.jsonl                               # 學到了什麼
+jq -r 'select(.ev=="inject")|.skills[]' skills-events-*.jsonl | sort | uniq -c | sort -rn    # 最常被用到的技能
+jq -r 'select(.ev=="promote")|"\(.tier)\t\(.title)"' skills-events-*.jsonl                   # 升級歷程
 ```
 
 範例(Docker Compose)— 同址 Qdrant + llama.cpp embedding server,學習導向免認證的內部 backend:

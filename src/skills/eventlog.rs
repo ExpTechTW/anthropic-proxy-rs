@@ -1,24 +1,25 @@
-//! Compact, persistent JSONL event log for the learning pipeline.
+//! Compact, persistent JSONL event log for the learning pipeline, rotated into **daily files**.
 //!
 //! Records just enough to analyse the learning funnel (distil → reject/verify → trust → inject)
-//! and tune it — one small JSON object per line, pruned to a retention window so it never grows
-//! without bound. Best-effort and off the request path: `record` only pushes a line into an
-//! in-memory buffer (bounded, dropped if full); a background task batches it to disk every couple
-//! of seconds and prunes hourly. Disabled unless a path is configured.
+//! and tune it — one small JSON object per line. Files are `<base>-YYYYMMDD.jsonl` (UTC date);
+//! pruning simply deletes whole files older than the retention window (no rewrite, no race with
+//! appends). Best-effort and off the request path: `record` only pushes a line into an in-memory
+//! buffer (bounded, dropped if full); a background task batches it to today's file every couple of
+//! seconds and prunes hourly. Disabled unless a path is configured.
 //!
-//! Analyse with `jq`, e.g.:
-//!   - funnel counts:   `jq -r .ev events.jsonl | sort | uniq -c`
-//!   - what got learned: `jq -r 'select(.ev=="distill") | .skills[]' events.jsonl`
-//!   - most-injected:    `jq -r 'select(.ev=="inject") | .skills[]' events.jsonl | sort | uniq -c | sort -rn`
+//! Analyse across days with a glob, e.g.:
+//!   - funnel counts:    `jq -r .ev skills-events-*.jsonl | sort | uniq -c`
+//!   - what got learned: `jq -r 'select(.ev=="distill")|.skills[]' skills-events-*.jsonl`
+//!   - most-injected:    `jq -r 'select(.ev=="inject")|.skills[]' skills-events-*.jsonl | sort | uniq -c | sort -rn`
 
 use serde_json::{json, Value};
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// (path, retention_secs) — set once when enabled.
+/// (stem, retention_secs). `stem` is the configured path minus a trailing `.jsonl`; daily files
+/// are `<stem>-YYYYMMDD.jsonl`.
 static CFG: OnceLock<(String, u64)> = OnceLock::new();
-/// Pending lines awaiting a flush.
 const MAX_PENDING: usize = 10_000;
 
 fn buffer() -> &'static Mutex<Vec<String>> {
@@ -28,13 +29,12 @@ fn buffer() -> &'static Mutex<Vec<String>> {
 
 /// Enable the event log (no-op if `path` is empty). Spawns the flusher + pruner.
 pub fn init(path: &str, retention_days: u64) {
-    if path.trim().is_empty() {
+    let path = path.trim();
+    if path.is_empty() {
         return;
     }
-    if CFG
-        .set((path.to_string(), retention_days.max(1) * 86_400))
-        .is_err()
-    {
+    let stem = path.strip_suffix(".jsonl").unwrap_or(path).to_string();
+    if CFG.set((stem, retention_days.max(1) * 86_400)).is_err() {
         return;
     }
     tokio::spawn(async move {
@@ -51,8 +51,11 @@ pub fn init(path: &str, retention_days: u64) {
             prune();
         }
     });
-    if let Some((p, r)) = CFG.get() {
-        tracing::info!(path = %p, retention_days = r / 86_400, "skills/eventlog: enabled");
+    if let Some((stem, r)) = CFG.get() {
+        tracing::info!(
+            retention_days = r / 86_400,
+            "skills/eventlog: enabled — daily files {stem}-YYYYMMDD.jsonl"
+        );
     }
 }
 
@@ -76,7 +79,7 @@ pub fn record(event: &str, fields: Value) {
 }
 
 fn flush() {
-    let Some((path, _)) = CFG.get() else {
+    let Some((stem, _)) = CFG.get() else {
         return;
     };
     let lines = {
@@ -86,44 +89,52 @@ fn flush() {
     if lines.is_empty() {
         return;
     }
-    if let Some(dir) = std::path::Path::new(path).parent() {
+    let path = format!("{stem}-{}.jsonl", ymd(now()));
+    if let Some(dir) = std::path::Path::new(&path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         for l in lines {
             let _ = writeln!(f, "{l}");
         }
     }
 }
 
+/// Delete day-files older than the retention window (by mtime). No rewrite, no race with appends;
+/// the current day's file keeps a fresh mtime so it is never pruned.
 fn prune() {
-    let Some((path, retention)) = CFG.get() else {
+    let Some((stem, retention)) = CFG.get() else {
         return;
     };
-    let Ok(content) = std::fs::read_to_string(path) else {
+    let p = std::path::Path::new(stem);
+    let Some(base) = p.file_name().and_then(|s| s.to_str()) else {
         return;
     };
-    let cutoff = now().saturating_sub(*retention);
-    let mut kept = Vec::new();
-    let mut changed = false;
-    for l in content.lines() {
-        let keep = serde_json::from_str::<Value>(l)
+    let prefix = format!("{base}-");
+    let dir = match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !(name.starts_with(&prefix) && name.ends_with(".jsonl")) {
+            continue;
+        }
+        let too_old = entry
+            .metadata()
             .ok()
-            .and_then(|v| v.get("t").and_then(Value::as_u64))
-            .map(|t| t >= cutoff)
-            .unwrap_or(true); // keep unparseable lines
-        if keep {
-            kept.push(l);
-        } else {
-            changed = true;
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|age| age.as_secs() > *retention)
+            .unwrap_or(false);
+        if too_old && std::fs::remove_file(entry.path()).is_ok() {
+            tracing::debug!(file = %name, "skills/eventlog: pruned old day-file");
         }
-    }
-    if changed {
-        let mut out = kept.join("\n");
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        let _ = std::fs::write(path, out);
     }
 }
 
@@ -132,4 +143,36 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn ymd(secs: u64) -> String {
+    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    format!("{y:04}{m:02}{d:02}")
+}
+
+/// Civil date (UTC) from days since the Unix epoch — Howard Hinnant's algorithm (no chrono dep).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    (y + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::civil_from_days;
+
+    #[test]
+    fn civil_from_days_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1)); // epoch
+        assert_eq!(civil_from_days(18_993), (2022, 1, 1));
+        // 2026-06-20 is 20624 days after the epoch.
+        assert_eq!(civil_from_days(20_624), (2026, 6, 20));
+    }
 }
