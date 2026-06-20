@@ -67,6 +67,10 @@ pub struct SkillsConfig {
     pub api_key: Option<String>,
     /// Retention for unverified candidates (days) before curation drops them.
     pub retention_days: u32,
+    /// Chat endpoint for background learning LLM calls. When set, calls go here with NO auth
+    /// (e.g. a no-auth internal backend), so background tasks need no client key; unset uses the
+    /// authed upstream + client key.
+    pub llm_url: Option<String>,
 }
 
 impl Default for SkillsConfig {
@@ -84,6 +88,7 @@ impl Default for SkillsConfig {
             llm_model: "auto".to_string(),
             api_key: None,
             retention_days: 30,
+            llm_url: None,
         }
     }
 }
@@ -147,6 +152,10 @@ impl SkillsConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(d.retention_days);
+        let llm_url = env::var("ANTHROPIC_PROXY_SKILLS_LLM_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         SkillsConfig {
             enabled,
             qdrant_url,
@@ -160,6 +169,7 @@ impl SkillsConfig {
             llm_model,
             api_key,
             retention_days,
+            llm_url,
         }
     }
 }

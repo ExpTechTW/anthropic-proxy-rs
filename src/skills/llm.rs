@@ -23,7 +23,12 @@ pub async fn chat(
     api_key: Option<&str>,
     max_tokens: u32,
 ) -> Option<String> {
-    let url = config.chat_completions_urls().into_iter().next()?;
+    // Prefer the configured background endpoint (e.g. a no-auth internal backend) so background
+    // tasks need no client key; otherwise the authed upstream + the provided key.
+    let (url, auth) = match &config.skills.llm_url {
+        Some(u) => (u.clone(), None),
+        None => (config.chat_completions_urls().into_iter().next()?, api_key),
+    };
     let body = json!({
         "model": config.skills.llm_model,
         "messages": [
@@ -36,7 +41,7 @@ pub async fn chat(
         "stream": false,
     });
     let mut rb = client.post(&url).timeout(LLM_TIMEOUT).json(&body);
-    if let Some(key) = api_key {
+    if let Some(key) = auth {
         rb = rb.header("Authorization", format!("Bearer {key}"));
     }
     let resp = rb.send().await.ok()?;
