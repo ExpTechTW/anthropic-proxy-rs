@@ -23,10 +23,13 @@ pub async fn chat(
     api_key: Option<&str>,
     max_tokens: u32,
 ) -> Option<String> {
-    // Prefer the configured background endpoint (e.g. a no-auth internal backend) so background
-    // tasks need no client key; otherwise the authed upstream + the provided key.
+    // Prefer the configured background endpoint so learning runs off the client's key/quota. When
+    // that endpoint needs auth (e.g. routing through the token-accounting upstream on :9000), the
+    // configured skills key is sent for ALL learning calls (distill/verify/proactive) uniformly; a
+    // no-auth internal backend simply leaves it unset → no header. Otherwise fall back to the authed
+    // upstream + the caller's key.
     let (url, auth) = match &config.skills.llm_url {
-        Some(u) => (u.clone(), None),
+        Some(u) => (u.clone(), config.skills.api_key.as_deref()),
         None => (config.chat_completions_urls().into_iter().next()?, api_key),
     };
     let body = json!({
