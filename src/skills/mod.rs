@@ -18,6 +18,7 @@ mod curate;
 mod distill;
 mod docs;
 mod embed;
+mod facts;
 mod eventlog;
 mod llm;
 mod proactive;

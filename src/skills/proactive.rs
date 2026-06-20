@@ -79,6 +79,9 @@ async fn run_once(config: &Config, client: &Client) {
     );
     let now = unix_now();
     for q in questions {
+        // Also cache any time-sensitive fact the question is after (versions, current state) into
+        // the separate facts store — independent of the skill we may distil below.
+        super::facts::maybe_learn_fact(config, client, &q).await;
         let Some(lesson) = research(config, client, &q).await else {
             continue;
         };

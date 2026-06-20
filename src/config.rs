@@ -52,6 +52,9 @@ pub struct SkillsConfig {
     pub qdrant_url: String,
     /// Qdrant collection holding the skill points.
     pub collection: String,
+    /// Separate Qdrant collection for the factual-memory store (time-sensitive facts; see
+    /// [`crate::skills`]). Kept apart from skills — facts have a different lifecycle (they decay).
+    pub facts_collection: String,
     /// Explicit embeddings endpoint; `None` derives one from the first upstream chat URL.
     pub embed_url: Option<String>,
     /// Embedding model name sent to the embeddings endpoint. Empty disables retrieval.
@@ -87,6 +90,9 @@ pub struct SkillsConfig {
     pub curate_interval_secs: u64,
     /// Enable proactive learning (research recent asked questions into candidates).
     pub proactive: bool,
+    /// Cache corroborated time-sensitive facts (versions, current state) into the facts store,
+    /// each stamped with an observation time + volatility-derived half-life.
+    pub facts: bool,
     /// How often the proactive-learning loop runs (seconds).
     pub proactive_interval_secs: u64,
     /// Path to a compact JSONL learning-event log (empty disables it). Persist via a volume.
@@ -109,6 +115,7 @@ impl Default for SkillsConfig {
             enabled: false,
             qdrant_url: "http://qdrant:6333".to_string(),
             collection: "skills".to_string(),
+            facts_collection: "facts".to_string(),
             embed_url: None,
             embed_model: String::new(),
             top_k: 3,
@@ -124,6 +131,7 @@ impl Default for SkillsConfig {
             verify_backoff_secs: 6 * 60 * 60,
             curate_interval_secs: 600,
             proactive: false,
+            facts: false,
             proactive_interval_secs: 600,
             eventlog_path: String::new(),
             eventlog_retention_days: 7,
@@ -150,6 +158,11 @@ impl SkillsConfig {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or(d.collection);
+        let facts_collection = env::var("ANTHROPIC_PROXY_SKILLS_FACTS_COLLECTION")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or(d.facts_collection);
         let embed_url = env::var("ANTHROPIC_PROXY_SKILLS_EMBED_URL")
             .ok()
             .map(|v| v.trim().to_string())
@@ -216,6 +229,9 @@ impl SkillsConfig {
         let proactive = env::var("ANTHROPIC_PROXY_SKILLS_PROACTIVE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let facts = env::var("ANTHROPIC_PROXY_SKILLS_FACTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let proactive_interval_secs = env::var("ANTHROPIC_PROXY_SKILLS_PROACTIVE_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -257,6 +273,8 @@ impl SkillsConfig {
             verify_backoff_secs,
             curate_interval_secs,
             proactive,
+            facts,
+            facts_collection,
             proactive_interval_secs,
             eventlog_path,
             eventlog_retention_days,
