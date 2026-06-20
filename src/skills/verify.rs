@@ -51,13 +51,21 @@ async fn run_once(config: &Config, client: &Client) {
         config.skills.collection.clone(),
         client.clone(),
     );
+    let now = unix_now();
 
-    // candidate -> verified (web-corroborated), several at a time
+    // candidate -> verified (web-corroborated), several at a time. A candidate that recently
+    // failed corroboration is skipped (backoff) so we don't re-search the same un-promotable
+    // entry every cycle — it gets retried after `verify_backoff_secs`, or dropped by retention.
     let candidates = qc.scroll_tier("candidate", SCROLL_BATCH).await;
     stream::iter(candidates)
         .for_each_concurrent(CONCURRENCY, |(id, p)| {
             let qc = &qc;
             async move {
+                if let Some(t) = p.verify_attempted_at {
+                    if now.saturating_sub(t) < config.skills.verify_backoff_secs {
+                        return;
+                    }
+                }
                 match verify(config, client, &p).await {
                     Some(true) => {
                         if qc
@@ -68,16 +76,17 @@ async fn run_once(config: &Config, client: &Client) {
                         }
                     }
                     Some(false) => {
-                        tracing::debug!(title = %p.title, "skills/verify: not corroborated; stays candidate");
+                        // Back off: stamp the attempt so we don't re-verify until the window passes.
+                        qc.set_payload(id, json!({"verify_attempted_at": unix_now()})).await;
+                        tracing::debug!(title = %p.title, "skills/verify: not corroborated; backing off");
                     }
-                    None => {} // transient (search/LLM unavailable) — retry next tick
+                    None => {} // transient (search/LLM unavailable) — retry next tick, no stamp
                 }
             }
         })
         .await;
 
     // verified -> trusted after the soak period
-    let now = unix_now();
     for (id, p) in qc.scroll_tier("verified", SCROLL_BATCH * 3).await {
         let promoted_at = p.verified_at.unwrap_or(now);
         if now.saturating_sub(promoted_at) >= config.skills.soak_secs

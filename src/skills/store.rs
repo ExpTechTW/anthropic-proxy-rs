@@ -40,6 +40,10 @@ pub struct SkillPayload {
     #[serde(default)]
     #[allow(dead_code)]
     pub created_at: Option<u64>,
+    /// Last verify attempt (unix secs) — drives re-attempt backoff so a candidate that can't be
+    /// corroborated isn't re-searched every cycle.
+    #[serde(default)]
+    pub verify_attempted_at: Option<u64>,
 }
 
 /// One search hit: the point id (as a string, whether Qdrant returned an int or uuid), its

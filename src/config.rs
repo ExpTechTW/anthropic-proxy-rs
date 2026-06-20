@@ -75,6 +75,9 @@ pub struct SkillsConfig {
     pub verify_interval_secs: u64,
     /// How long a `verified` entry must soak before it can become `trusted` (seconds).
     pub soak_secs: u64,
+    /// Don't re-attempt verifying a candidate that recently failed corroboration, for this many
+    /// seconds (avoids re-searching the same un-promotable candidate every cycle).
+    pub verify_backoff_secs: u64,
     /// How often the curation loop (retention + dedup) runs (seconds).
     pub curate_interval_secs: u64,
     /// Enable proactive learning (research recent asked questions into candidates).
@@ -101,6 +104,7 @@ impl Default for SkillsConfig {
             llm_url: None,
             verify_interval_secs: 300,
             soak_secs: 14 * 24 * 60 * 60,
+            verify_backoff_secs: 6 * 60 * 60,
             curate_interval_secs: 600,
             proactive: false,
             proactive_interval_secs: 600,
@@ -179,6 +183,10 @@ impl SkillsConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(d.soak_secs);
+        let verify_backoff_secs = env::var("ANTHROPIC_PROXY_SKILLS_VERIFY_BACKOFF_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d.verify_backoff_secs);
         let curate_interval_secs = env::var("ANTHROPIC_PROXY_SKILLS_CURATE_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -206,6 +214,7 @@ impl SkillsConfig {
             llm_url,
             verify_interval_secs,
             soak_secs,
+            verify_backoff_secs,
             curate_interval_secs,
             proactive,
             proactive_interval_secs,
