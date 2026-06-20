@@ -11,6 +11,7 @@
 use super::{llm, store};
 use crate::config::Config;
 use crate::websearch::WebSearchClient;
+use futures::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -21,6 +22,9 @@ const SCROLL_BATCH: u32 = 20;
 const MIN_DOMAINS: usize = 2; // independent corroborating hosts required to promote
 const MIN_CONFIDENCE: f32 = 0.6;
 const VERDICT_MAX_TOKENS: u32 = 512;
+/// Verify several candidates at once so the loop keeps up with aggressive learning, but kept
+/// modest so we don't overload the shared backend / search egress.
+const CONCURRENCY: usize = 3;
 
 /// Start the verification loop (no-op unless learning is enabled).
 pub fn spawn(config: Arc<Config>, client: Client) {
@@ -28,6 +32,8 @@ pub fn spawn(config: Arc<Config>, client: Client) {
         return;
     }
     tokio::spawn(async move {
+        // Let the co-located search server finish starting before the first pass.
+        tokio::time::sleep(Duration::from_secs(15)).await;
         let mut tick =
             tokio::time::interval(Duration::from_secs(config.skills.verify_interval_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -46,23 +52,29 @@ async fn run_once(config: &Config, client: &Client) {
         client.clone(),
     );
 
-    // candidate -> verified (web-corroborated)
-    for (id, p) in qc.scroll_tier("candidate", SCROLL_BATCH).await {
-        match verify(config, client, &p).await {
-            Some(true) => {
-                if qc
-                    .set_payload(id, json!({"tier": "verified", "verified_at": unix_now()}))
-                    .await
-                {
-                    tracing::info!(title = %p.title, "skills/verify: candidate -> verified");
+    // candidate -> verified (web-corroborated), several at a time
+    let candidates = qc.scroll_tier("candidate", SCROLL_BATCH).await;
+    stream::iter(candidates)
+        .for_each_concurrent(CONCURRENCY, |(id, p)| {
+            let qc = &qc;
+            async move {
+                match verify(config, client, &p).await {
+                    Some(true) => {
+                        if qc
+                            .set_payload(id, json!({"tier": "verified", "verified_at": unix_now()}))
+                            .await
+                        {
+                            tracing::info!(title = %p.title, "skills/verify: candidate -> verified");
+                        }
+                    }
+                    Some(false) => {
+                        tracing::debug!(title = %p.title, "skills/verify: not corroborated; stays candidate");
+                    }
+                    None => {} // transient (search/LLM unavailable) — retry next tick
                 }
             }
-            Some(false) => {
-                tracing::debug!(title = %p.title, "skills/verify: not corroborated; stays candidate");
-            }
-            None => {} // transient (search/LLM unavailable) — retry next tick
-        }
-    }
+        })
+        .await;
 
     // verified -> trusted after the soak period
     let now = unix_now();
