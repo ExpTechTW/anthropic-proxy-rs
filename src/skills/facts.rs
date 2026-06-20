@@ -163,6 +163,72 @@ pub async fn maybe_learn_fact(config: &Config, client: &Client, question: &str) 
     }
 }
 
+const FACTS_TOP: u32 = 5;
+const FACTS_MIN_SCORE: f32 = 0.5; // facts are specific — require a decent match before injecting
+const FRESH_FLOOR: f32 = 0.25; // skip facts decayed too far (likely stale)
+const FACTS_INJECT_MAX: usize = 2;
+
+/// Retrieve still-fresh facts relevant to `query`, ranked by similarity × freshness (a recency
+/// prior fused with semantic match — proven near-perfect on freshness tasks), and format them as
+/// time-stamped "As of <date>: …" lines for injection. `None` when facts are off or nothing fresh
+/// matches. Read side of the factual memory; best-effort (never blocks the request).
+pub async fn relevant_facts(config: &Config, client: &Client, query: &str) -> Option<String> {
+    if !config.skills.facts || query.trim().is_empty() {
+        return None;
+    }
+    let vector = embed::embed(config, client, query, None).await?;
+    let qc = store::QdrantClient::new(
+        config.skills.qdrant_url.clone(),
+        config.skills.facts_collection.clone(),
+        client.clone(),
+    );
+    let now = unix_now();
+    let mut ranked: Vec<(f32, FactPayload)> = qc
+        .search_raw(&vector, FACTS_TOP, FACTS_MIN_SCORE, &[], false)
+        .await
+        .into_iter()
+        .filter_map(|h| {
+            let f: FactPayload = serde_json::from_value(h.payload).ok()?;
+            let obs = f.observed_at.unwrap_or(now);
+            let hl = f.half_life_secs.unwrap_or(DEFAULT_HALF_LIFE).max(1);
+            let fresh = (-(now.saturating_sub(obs) as f32) / hl as f32).exp();
+            if fresh < FRESH_FLOOR {
+                return None; // decayed too far — don't inject a likely-stale value
+            }
+            Some((h.score * fresh, f))
+        })
+        .collect();
+    if ranked.is_empty() {
+        return None;
+    }
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(FACTS_INJECT_MAX);
+    let mut out = String::new();
+    for (_, f) in &ranked {
+        let claim = if f.claim.trim().is_empty() {
+            format!("{} = {}", f.subject, f.value)
+        } else {
+            f.claim.trim().to_string()
+        };
+        out.push_str(&format!("- As of {}: {}\n", ymd(f.observed_at.unwrap_or(now)), claim));
+    }
+    Some(out)
+}
+
+/// Days-since-epoch → "YYYY-MM-DD" (Howard Hinnant's civil_from_days), for the "as of" stamp.
+fn ymd(epoch: u64) -> String {
+    let z = (epoch / 86_400) as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
 /// Start the fact validity/refresh loop: periodically re-check facts whose freshness has decayed
 /// (age past half the half-life) and re-research them — confirming (refresh timestamp), updating
 /// (belief revision, new value), or leaving them stamped for backoff. Search-bound, so it shares

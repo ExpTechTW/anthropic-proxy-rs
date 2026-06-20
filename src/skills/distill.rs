@@ -25,6 +25,13 @@ const MAX_LESSONS: usize = 3;
 // Room for the model's (often unsuppressed) reasoning_content PLUS up to 3 JSON lessons in
 // content — a tight budget truncates mid-thought and yields empty/invalid output.
 const JUDGE_MAX_TOKENS: u32 = 3072;
+/// A new lesson this similar to a promoted skill is a contradiction candidate worth an LLM check.
+const CONTRA_MIN_SCORE: f32 = 0.82;
+const CONTRA_MAX_TOKENS: u32 = 2048;
+const CONTRA_SYSTEM: &str = "You compare two engineering lessons for an AI coding assistant. Decide \
+whether lesson B CONTRADICTS lesson A — i.e. gives opposite or incompatible advice for the same \
+situation (not merely overlapping, broader, or unrelated). Output STRICT JSON only, no prose: \
+{\"contradict\": true|false}";
 
 /// Per-conversation throttle: signature -> message count at last distillation.
 fn tracker() -> &'static Mutex<HashMap<u64, usize>> {
@@ -172,6 +179,31 @@ async fn distill(config: &Config, client: &Client, transcript: &str, api_key: Op
         if qc.upsert(id, &vector, payload).await {
             written += 1;
         }
+        // Contradiction check: does this lesson conflict with an existing PROMOTED skill (opposite
+        // advice for the same situation)? Surface it rather than silently accumulating both — the
+        // re-verify loop then resolves which one actually holds up against the web.
+        let near = qc
+            .search_raw(
+                &vector,
+                1,
+                CONTRA_MIN_SCORE,
+                &["verified".to_string(), "trusted".to_string()],
+                false,
+            )
+            .await;
+        if let Some(h) = near.first() {
+            if let Ok(ex) = serde_json::from_value::<store::SkillPayload>(h.payload.clone()) {
+                if ex.title.to_lowercase() != l.title.to_lowercase()
+                    && contradicts(config, client, l, &ex).await
+                {
+                    tracing::info!(new = %l.title, existing = %ex.title, "skills/distill: contradiction with existing skill");
+                    super::eventlog::record(
+                        "contradiction",
+                        json!({"new": l.title.clone(), "existing": ex.title.clone()}),
+                    );
+                }
+            }
+        }
     }
     if written > 0 {
         tracing::info!(written, outcome = %judged.outcome, "skills/distill: wrote candidate lessons");
@@ -184,6 +216,38 @@ async fn distill(config: &Config, client: &Client, transcript: &str, api_key: Op
             }),
         );
     }
+}
+
+#[derive(Deserialize)]
+struct ContraVerdict {
+    #[serde(default)]
+    contradict: bool,
+}
+
+/// Ask the (unmetered) LLM whether the new lesson contradicts an existing promoted skill.
+async fn contradicts(
+    config: &Config,
+    client: &Client,
+    new_l: &Lesson,
+    existing: &store::SkillPayload,
+) -> bool {
+    let user = format!(
+        "Lesson A (existing):\nTitle: {}\nBody: {}\n\nLesson B (new):\nTitle: {}\nBody: {}\n\nDoes B contradict A? Return the JSON.",
+        existing.title, existing.body, new_l.title, new_l.body
+    );
+    matches!(
+        llm::chat_json(
+            config,
+            client,
+            CONTRA_SYSTEM,
+            &user,
+            super::background_api_key(config).as_deref(),
+            CONTRA_MAX_TOKENS,
+        )
+        .await
+        .and_then(|v| serde_json::from_value::<ContraVerdict>(v).ok()),
+        Some(ContraVerdict { contradict: true })
+    )
 }
 
 fn unix_now() -> u64 {

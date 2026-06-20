@@ -106,6 +106,35 @@ async fn run_once(config: &Config, client: &Client) {
             super::eventlog::record("promote", json!({"tier": "trusted", "title": p.title.clone()}));
         }
     }
+
+    // Re-verify promoted skills periodically. Additive memory rots when it assumes promoted
+    // knowledge stays correct; re-corroborate the ones not checked within `reverify_age_secs` and
+    // DEMOTE any that no longer hold (→ candidate, so it stops being injected). Combats
+    // self-reinforcing error / obsolete knowledge. Search-bound → shares the global rate-gate.
+    let due = config.skills.reverify_age_secs;
+    let mut promoted = qc.scroll_tier("verified", SCROLL_BATCH).await;
+    promoted.extend(qc.scroll_tier("trusted", SCROLL_BATCH).await);
+    for (id, p) in promoted {
+        let last = p.reverified_at.or(p.verified_at).unwrap_or(now);
+        if now.saturating_sub(last) < due {
+            continue; // not due for re-check yet
+        }
+        match verify(config, client, &p).await {
+            Some(true) => {
+                qc.set_payload(id, json!({"reverified_at": now})).await;
+            }
+            Some(false) => {
+                if qc
+                    .set_payload(id, json!({"tier": "candidate", "reverified_at": now}))
+                    .await
+                {
+                    tracing::info!(title = %p.title, "skills/verify: demoted promoted skill (no longer corroborated)");
+                    super::eventlog::record("demote", json!({"title": p.title.clone()}));
+                }
+            }
+            None => {} // transient (search/LLM) — retry next due cycle
+        }
+    }
 }
 
 #[derive(Deserialize)]

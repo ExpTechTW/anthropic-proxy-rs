@@ -44,6 +44,10 @@ pub struct SkillPayload {
     /// corroborated isn't re-searched every cycle.
     #[serde(default)]
     pub verify_attempted_at: Option<u64>,
+    /// Last RE-verification of a promoted (verified/trusted) skill — drives periodic re-checking so
+    /// stale/wrong knowledge isn't injected forever (combats self-reinforcing error).
+    #[serde(default)]
+    pub reverified_at: Option<u64>,
 }
 
 /// One search hit: the point id (as a string, whether Qdrant returned an int or uuid), its
@@ -124,6 +128,32 @@ struct RawScrollPoint {
     id: Value,
     #[serde(default)]
     payload: Value,
+}
+
+/// One scored search hit with the raw payload (+ optionally the vector) — used by retrieval that
+/// needs the vector (MMR diversity) or a non-`SkillPayload` shape (facts).
+pub struct RawScored {
+    pub score: f32,
+    pub id: u64,
+    pub payload: Value,
+    pub vector: Option<Vec<f32>>,
+}
+
+#[derive(Deserialize)]
+struct RawScoredResp {
+    #[serde(default)]
+    result: Vec<RawScoredPoint>,
+}
+
+#[derive(Deserialize)]
+struct RawScoredPoint {
+    id: Value,
+    #[serde(default)]
+    score: f32,
+    #[serde(default)]
+    payload: Value,
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
 }
 
 /// Decode a Qdrant point id (we always write u64 ids) back to u64.
@@ -277,6 +307,62 @@ impl QdrantClient {
                 let id = id_as_u64(&p.id)?;
                 let vector = p.vector?;
                 Some((id, p.payload, vector))
+            })
+            .collect()
+    }
+
+    /// Generic scored kNN search returning raw payloads (+ optional vectors), with an optional tier
+    /// filter. Backs MMR-diversified skill injection (needs vectors) and facts retrieval (different
+    /// payload). Best-effort: empty on failure.
+    pub async fn search_raw(
+        &self,
+        vector: &[f32],
+        top_k: u32,
+        min_score: f32,
+        tiers: &[String],
+        with_vector: bool,
+    ) -> Vec<RawScored> {
+        let url = format!("{}/collections/{}/points/search", self.base, self.collection);
+        let mut body = json!({
+            "vector": vector,
+            "limit": top_k,
+            "with_payload": true,
+            "with_vector": with_vector,
+            "score_threshold": min_score,
+        });
+        if !tiers.is_empty() {
+            let should: Vec<Value> = tiers
+                .iter()
+                .map(|t| json!({"key": "tier", "match": {"value": t}}))
+                .collect();
+            body["filter"] = json!({ "should": should });
+        }
+        let Ok(resp) = self
+            .http
+            .post(&url)
+            .timeout(QDRANT_TIMEOUT)
+            .json(&body)
+            .send()
+            .await
+        else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(parsed) = resp.json::<RawScoredResp>().await else {
+            return Vec::new();
+        };
+        parsed
+            .result
+            .into_iter()
+            .filter_map(|p| {
+                id_as_u64(&p.id).map(|id| RawScored {
+                    score: p.score,
+                    id,
+                    payload: p.payload,
+                    vector: p.vector,
+                })
             })
             .collect()
     }

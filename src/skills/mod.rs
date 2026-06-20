@@ -38,6 +38,7 @@ pub use verify::spawn as spawn_verify;
 pub use curate::spawn as spawn_curate;
 pub use proactive::{record_question, spawn as spawn_proactive};
 pub use facts::spawn_validity as spawn_facts_validity;
+pub use facts::relevant_facts;
 pub use reflect::spawn as spawn_reflect;
 pub use eventlog::record as log_event;
 
@@ -145,6 +146,56 @@ pub struct RetrievedSkill {
     pub score: f32,
 }
 
+/// Candidate pool for MMR — over-fetch, then diversify down to top_k.
+const MMR_POOL: u32 = 12;
+/// MMR relevance/diversity tradeoff (higher favours relevance).
+const MMR_LAMBDA: f32 = 0.7;
+
+/// Maximal Marginal Relevance (Carbonell & Goldstein 1998): greedily pick `k` items that are
+/// relevant to the query (high score) yet dissimilar to those already picked — so we never spend
+/// scarce injection slots on near-duplicate lessons (redundant context dilutes attention, and
+/// retrieval quality is the dominant factor in memory utility). Naturally injects fewer when fewer
+/// candidates clear `min_score`.
+fn mmr_select(mut pool: Vec<store::RawScored>, k: usize) -> Vec<store::RawScored> {
+    let mut selected: Vec<store::RawScored> = Vec::new();
+    while selected.len() < k && !pool.is_empty() {
+        let mut best = 0usize;
+        let mut best_mmr = f32::MIN;
+        for (i, c) in pool.iter().enumerate() {
+            let max_sim = selected
+                .iter()
+                .filter_map(|s| match (&c.vector, &s.vector) {
+                    (Some(a), Some(b)) => Some(cosine(a, b)),
+                    _ => None,
+                })
+                .fold(0.0f32, f32::max);
+            let mmr = MMR_LAMBDA * c.score - (1.0 - MMR_LAMBDA) * max_sim;
+            if mmr > best_mmr {
+                best_mmr = mmr;
+                best = i;
+            }
+        }
+        selected.push(pool.remove(best));
+    }
+    selected
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+    for k in 0..a.len() {
+        dot += a[k] * b[k];
+        na += a[k] * a[k];
+        nb += b[k] * b[k];
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
 /// Retrieve the top relevant injectable skills for `query`. Returns an empty vec when the feature
 /// is disabled, the query is empty, or anything fails — the request then proceeds untouched.
 pub async fn retrieve(
@@ -164,24 +215,26 @@ pub async fn retrieve(
         config.skills.collection.clone(),
         client.clone(),
     );
-    let Some(found) = qc
-        .search(
+    // Over-fetch a candidate pool WITH vectors, then MMR-select top_k (relevant + diverse).
+    let pool = qc
+        .search_raw(
             &vector,
-            config.skills.top_k,
+            MMR_POOL,
             config.skills.min_score,
             &config.skills.inject_tiers,
+            true,
         )
-        .await
-    else {
-        return Vec::new();
-    };
-    found
+        .await;
+    mmr_select(pool, config.skills.top_k as usize)
         .into_iter()
-        .map(|s| RetrievedSkill {
-            id: s.id,
-            title: s.payload.title,
-            body: s.payload.body,
-            score: s.score,
+        .filter_map(|s| {
+            let p: store::SkillPayload = serde_json::from_value(s.payload).ok()?;
+            Some(RetrievedSkill {
+                id: s.id.to_string(),
+                title: p.title,
+                body: p.body,
+                score: s.score,
+            })
         })
         .collect()
 }
@@ -223,6 +276,20 @@ pub fn inject_docs(req: &mut anthropic::AnthropicRequest, docs: &str) {
         "# Up-to-date library documentation (retrieved)\n\
          The following are current docs for libraries mentioned in the task — prefer them over \
          prior knowledge.\n\n{docs}"
+    );
+    append_system_block(req, text);
+}
+
+/// Inject relevant, still-fresh facts as a system block — time-stamped "as of" snapshots, so the
+/// model treats them as current-as-of-that-date (push; streaming-preserving). No-op when empty.
+pub fn inject_facts(req: &mut anthropic::AnthropicRequest, facts: &str) {
+    if facts.trim().is_empty() {
+        return;
+    }
+    let text = format!(
+        "# Current facts (time-sensitive, retrieved)\n\
+         Verified, time-stamped facts relevant to the task. Each notes when it was last confirmed — \
+         treat it as current only as of that date, and re-check if precision matters.\n\n{facts}"
     );
     append_system_block(req, text);
 }

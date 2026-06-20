@@ -70,6 +70,15 @@ pub async fn proxy_handler(
         }
     }
 
+    // Factual memory read-side: inject still-fresh, time-stamped facts relevant to the query
+    // (freshness-weighted; rendered "as of <date>"). Respects the same opt-out as skill injection.
+    if config.skills.facts && !skills_inject_disabled(&headers) {
+        if let Some(facts) = skills::relevant_facts(&config, &client, &user_text).await {
+            skills::inject_facts(&mut req, &facts);
+            tracing::info!("skills: injected current facts");
+        }
+    }
+
     // Stage 2: learn from this conversation's history in the background (off the request path;
     // throttled per-conversation; no-op unless ANTHROPIC_PROXY_SKILLS_LEARN is set).
     skills::maybe_spawn_distill(config.clone(), client.clone(), &req, api_key.clone());
