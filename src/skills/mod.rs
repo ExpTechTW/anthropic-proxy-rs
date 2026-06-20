@@ -13,15 +13,44 @@
 //! large store must not flood the prompt — over-injection degrades quality), and graceful
 //! degradation everywhere.
 
+mod distill;
 mod embed;
+mod llm;
 mod store;
 
 #[allow(unused_imports)]
 pub use store::{stable_id, QdrantClient};
+pub use distill::maybe_spawn as maybe_spawn_distill;
 
 use crate::config::Config;
 use crate::models::anthropic;
 use reqwest::Client;
+use std::sync::{Mutex, OnceLock};
+
+/// Remember the most recent non-empty client API key so background learning loops (which run off
+/// the request path and have no client key) can still call the upstream in passthrough mode.
+fn remembered_key() -> &'static Mutex<Option<String>> {
+    static K: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    K.get_or_init(|| Mutex::new(None))
+}
+
+pub fn remember_api_key(key: Option<&str>) {
+    if let Some(k) = key {
+        if !k.is_empty() {
+            *remembered_key().lock().unwrap() = Some(k.to_string());
+        }
+    }
+}
+
+/// The API key background tasks should use: the configured one, else the last-seen client key.
+#[allow(dead_code)]
+pub fn background_api_key(config: &Config) -> Option<String> {
+    config
+        .skills
+        .api_key
+        .clone()
+        .or_else(|| remembered_key().lock().unwrap().clone())
+}
 
 /// A skill chosen for injection, carrying what we need to render it and report it back.
 #[derive(Debug, Clone)]

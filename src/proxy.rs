@@ -27,6 +27,7 @@ pub async fn proxy_handler(
     let client_model = req.model.clone();
 
     let api_key = resolve_api_key(&config, &headers);
+    skills::remember_api_key(api_key.as_deref());
 
     // Auto-inject relevant learned skills (Stage 1). Best-effort: embedding/Qdrant failures
     // return no skills and the request proceeds untouched, so the feature can never break a call.
@@ -45,6 +46,10 @@ pub async fn proxy_handler(
     } else {
         Vec::new()
     };
+
+    // Stage 2: learn from this conversation's history in the background (off the request path;
+    // throttled per-conversation; no-op unless ANTHROPIC_PROXY_SKILLS_LEARN is set).
+    skills::maybe_spawn_distill(config.clone(), client.clone(), &req, api_key.clone());
 
     tracing::debug!(model = %client_model, streaming = is_streaming, "received request");
     metrics::request_started(is_streaming);

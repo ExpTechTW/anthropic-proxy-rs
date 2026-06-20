@@ -58,6 +58,15 @@ pub struct SkillsConfig {
     pub min_score: f32,
     /// Trust tiers eligible for injection (e.g. `verified`, `trusted`). Candidates are excluded.
     pub inject_tiers: Vec<String>,
+    /// Learn from finished conversations (Stage 2 distillation write path).
+    pub learn: bool,
+    /// Model for background learning LLM calls (distil/judge/verify). Default `auto`.
+    pub llm_model: String,
+    /// API key for background LLM/embedding calls not tied to a client request (verification,
+    /// proactive study). Falls back to the last-seen client key when unset (passthrough mode).
+    pub api_key: Option<String>,
+    /// Retention for unverified candidates (days) before curation drops them.
+    pub retention_days: u32,
 }
 
 impl Default for SkillsConfig {
@@ -71,6 +80,10 @@ impl Default for SkillsConfig {
             top_k: 3,
             min_score: 0.5,
             inject_tiers: vec!["verified".to_string(), "trusted".to_string()],
+            learn: false,
+            llm_model: "auto".to_string(),
+            api_key: None,
+            retention_days: 30,
         }
     }
 }
@@ -118,6 +131,22 @@ impl SkillsConfig {
             })
             .filter(|v| !v.is_empty())
             .unwrap_or(d.inject_tiers);
+        let learn = env::var("ANTHROPIC_PROXY_SKILLS_LEARN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let llm_model = env::var("ANTHROPIC_PROXY_SKILLS_LLM_MODEL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or(d.llm_model);
+        let api_key = env::var("ANTHROPIC_PROXY_SKILLS_API_KEY")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let retention_days = env::var("ANTHROPIC_PROXY_SKILLS_RETENTION_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d.retention_days);
         SkillsConfig {
             enabled,
             qdrant_url,
@@ -127,6 +156,10 @@ impl SkillsConfig {
             top_k,
             min_score,
             inject_tiers,
+            learn,
+            llm_model,
+            api_key,
+            retention_days,
         }
     }
 }
