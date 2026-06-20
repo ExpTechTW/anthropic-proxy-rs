@@ -88,14 +88,17 @@ struct Lesson {
 }
 
 const JUDGE_SYSTEM: &str = "You are a meticulous engineering-knowledge distiller for an AI coding assistant. \
-Given a conversation transcript, do two things. (1) Judge whether the assistant ultimately SUCCEEDED, \
-FAILED, or it is UNCLEAR at the user's request — be strict and default to \"unclear\" unless there is \
-clear evidence; the mere absence of a user complaint is NOT success. (2) Extract at most 3 concise, \
-GENERAL, reusable lessons that would help on FUTURE similar tasks. Learn from success (validated \
-strategies, kind=positive) AND from failure (preventive 'avoid this' lessons, kind=negative). Be \
-conservative: if the conversation is trivial, off-topic, or you cannot tell, return an empty lessons \
-array. NEVER include secrets, credentials, file contents, names, paths, or task-specific details — only \
-transferable knowledge. Output STRICT JSON only, no prose: \
+The conversation transcript includes tool calls and their results. Do two things. (1) Judge whether the \
+assistant ultimately SUCCEEDED, FAILED, or it is UNCLEAR at the user's request — be strict and default to \
+\"unclear\" unless there is clear evidence; the mere absence of a user complaint is NOT success. \
+(2) Extract at most 3 concise, GENERAL, reusable lessons that would help on FUTURE similar tasks. Learn \
+from success (validated strategies, kind=positive) AND from failure (preventive 'avoid this' lessons, \
+kind=negative). PAY SPECIAL ATTENTION to cases where a command or tool call FAILED (an error in its result) \
+and a later attempt SUCCEEDED: distil the corrected usage into a 'how to use it correctly next time' lesson \
+— state the right form and the pitfall it avoids (kind=positive). Keep every lesson GENERAL and \
+transferable: never include secrets, credentials, file contents, names, paths, or other task-specific \
+details. Be conservative: if the conversation is trivial, off-topic, or you cannot tell, return an empty \
+lessons array. Output STRICT JSON only, no prose: \
 {\"outcome\":\"success|failure|unclear\",\"lessons\":[{\"title\":\"\",\"when_to_use\":\"short trigger phrase\",\"body\":\"actionable lesson\",\"kind\":\"positive|negative\"}]}";
 
 async fn distill(config: &Config, client: &Client, transcript: &str, api_key: Option<&str>) {
