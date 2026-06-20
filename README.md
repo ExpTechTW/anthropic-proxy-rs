@@ -333,6 +333,8 @@ Everything is non-parametric — "learning" is writing rows to Qdrant — and ev
 | `ANTHROPIC_PROXY_SKILLS_RETENTION_DAYS` | `30` | Drop unverified candidates older than this |
 | `ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH` | – | Path to a compact JSONL learning-event log (empty = off); persist via a volume |
 | `ANTHROPIC_PROXY_SKILLS_EVENTLOG_RETENTION_DAYS` | `7` | Days to retain event-log entries |
+| `ANTHROPIC_PROXY_SKILLS_TOOLS` | `false` | Inject `recall_skills` + `search_docs` as tools the model can call. **Requests then buffer through a tool loop — no token streaming.** |
+| `ANTHROPIC_PROXY_SKILLS_DOCS_MCP_URL` | – | docs-mcp MCP endpoint for `search_docs` (self-hosted [docs-mcp-server](https://github.com/arabold/docs-mcp-server)) |
 
 > **Safety.** Learning from the open web is a documented poisoning vector, so the trust gate is the load-bearing control: unverified knowledge is never injected, promotion requires independent multi-source corroboration rather than the model's confidence, and the web-reading LLM is quarantined (no tools / no write access). Treat your embeddings / LLM / Qdrant endpoints as trusted infrastructure.
 
@@ -344,6 +346,13 @@ jq -r 'select(.ev=="distill")|.skills[]' skills-events-*.jsonl                  
 jq -r 'select(.ev=="inject")|.skills[]' skills-events-*.jsonl | sort | uniq -c | sort -rn    # most-used skills
 jq -r 'select(.ev=="promote")|"\(.tier)\t\(.title)"' skills-events-*.jsonl                   # promotions over time
 ```
+
+**Pull instead of push — proxy-injected tools (`ANTHROPIC_PROXY_SKILLS_TOOLS`).** As an alternative to auto-injection, the proxy can expose two function tools the model pulls on demand and **executes itself** (transparent to the client, client-side tools handed back untouched — like the web-search emulation):
+
+- `recall_skills(query)` — query the learned-skill store.
+- `search_docs(library, query)` — query a self-hosted **[docs-mcp-server](https://github.com/arabold/docs-mcp-server)** (`ANTHROPIC_PROXY_SKILLS_DOCS_MCP_URL`) for up-to-date, version-specific library docs (an open-source, self-hostable Context7 alternative; point its embeddings at the same endpoint via `OPENAI_API_BASE` + `DOCS_MCP_EMBEDDING_MODEL`). This suits large reference docs better than push-injection, which is best kept for small learned lessons.
+
+**Caveat:** with tools enabled, requests run through a buffered tool loop, so they lose token-by-token streaming (heartbeats keep the connection alive) — the same tradeoff as the web-search agent.
 
 Example (Docker Compose) — co-located Qdrant + a llama.cpp embedding server, with learning routed at a no-auth internal backend:
 
