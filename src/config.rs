@@ -88,6 +88,11 @@ pub struct SkillsConfig {
     pub eventlog_path: String,
     /// Days to retain learning-event log entries.
     pub eventlog_retention_days: u64,
+    /// Inject proxy-handled tools (`recall_skills` + `search_docs`) the model can call on demand.
+    /// Requests then run through a tool loop (buffered + replayed; no token streaming).
+    pub tools: bool,
+    /// docs-mcp MCP endpoint for the `search_docs` tool (None disables that tool).
+    pub docs_mcp_url: Option<String>,
 }
 
 impl Default for SkillsConfig {
@@ -114,6 +119,8 @@ impl Default for SkillsConfig {
             proactive_interval_secs: 600,
             eventlog_path: String::new(),
             eventlog_retention_days: 7,
+            tools: false,
+            docs_mcp_url: None,
         }
     }
 }
@@ -212,6 +219,13 @@ impl SkillsConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(d.eventlog_retention_days);
+        let tools = env::var("ANTHROPIC_PROXY_SKILLS_TOOLS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let docs_mcp_url = env::var("ANTHROPIC_PROXY_SKILLS_DOCS_MCP_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         SkillsConfig {
             enabled,
             qdrant_url,
@@ -234,6 +248,8 @@ impl SkillsConfig {
             proactive_interval_secs,
             eventlog_path,
             eventlog_retention_days,
+            tools,
+            docs_mcp_url,
         }
     }
 }

@@ -13,6 +13,7 @@
 //! large store must not flood the prompt — over-injection degrades quality), and graceful
 //! degradation everywhere.
 
+mod agent;
 mod curate;
 mod distill;
 mod embed;
@@ -21,6 +22,10 @@ mod llm;
 mod proactive;
 mod store;
 mod verify;
+
+pub use agent::{
+    enabled as agent_enabled, handle as agent_handle, inject_tools as agent_inject_tools,
+};
 
 #[allow(unused_imports)]
 pub use store::{stable_id, QdrantClient};

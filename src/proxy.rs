@@ -92,7 +92,15 @@ pub async fn proxy_handler(
     }
 
     let policy = translation_policy(&config);
-    let openai_req = pipeline::translate_request(req, &policy)?;
+    let mut openai_req = pipeline::translate_request(req, &policy)?;
+
+    // Proxy-injected tools (recall_skills + search_docs): inject and route through the agent loop,
+    // unless this is already the web-search path. Off unless ANTHROPIC_PROXY_SKILLS_TOOLS=1.
+    let use_agent = !use_websearch && skills::agent_enabled(&config);
+    if use_agent {
+        skills::agent_inject_tools(&config, &mut openai_req);
+    }
+
     let upstream_model = openai_req.model.clone();
 
     if config.verbose {
@@ -104,6 +112,8 @@ pub async fn proxy_handler(
 
     let result = if use_websearch {
         websearch_agent::handle(config, client, openai_req, api_key, is_streaming).await
+    } else if use_agent {
+        skills::agent_handle(&config, &client, openai_req, api_key.as_deref(), is_streaming).await
     } else if is_streaming {
         handle_streaming(config, client, openai_req, api_key).await
     } else {
