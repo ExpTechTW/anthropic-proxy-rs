@@ -240,6 +240,12 @@ async fn run_loop(
 
         // Terminal: a plain answer, or a client-side tool call we must hand back.
         if !all_proxy {
+            // Preserve extended-thinking output (precedes the visible answer).
+            if let Some(t) = &msg.reasoning_content {
+                if !t.is_empty() {
+                    blocks.push(json!({"type": "thinking", "thinking": t}));
+                }
+            }
             push_text(&mut blocks, msg.content.as_deref());
             if tool_calls.is_empty() {
                 out.stop_reason = "end_turn".to_string();
@@ -479,6 +485,16 @@ fn render_block_events(blocks: &[Value]) -> Vec<String> {
                     "type": "content_block_delta", "index": index,
                     "delta": {"type": "input_json_delta",
                               "partial_json": serde_json::to_string(&input).unwrap_or_default()}})));
+                frames.push(stop_frame(index));
+            }
+            "thinking" => {
+                let thinking = block.get("thinking").and_then(Value::as_str).unwrap_or("");
+                frames.push(sse_event("content_block_start", &json!({
+                    "type": "content_block_start", "index": index,
+                    "content_block": {"type": "thinking", "thinking": ""}})));
+                frames.push(sse_event("content_block_delta", &json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "thinking_delta", "thinking": thinking}})));
                 frames.push(stop_frame(index));
             }
             _ => {}
