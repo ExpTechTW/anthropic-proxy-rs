@@ -103,6 +103,10 @@ async fn run_once(config: &Config, client: &Client) {
         });
         if qc.upsert(id, &vector, payload).await {
             tracing::info!(title = %lesson.title, "skills/proactive: wrote candidate from asked question");
+            super::eventlog::record(
+                "proactive",
+                json!({"title": lesson.title.clone(), "q": q.chars().take(120).collect::<String>()}),
+            );
         }
     }
 }

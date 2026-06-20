@@ -84,6 +84,10 @@ pub struct SkillsConfig {
     pub proactive: bool,
     /// How often the proactive-learning loop runs (seconds).
     pub proactive_interval_secs: u64,
+    /// Path to a compact JSONL learning-event log (empty disables it). Persist via a volume.
+    pub eventlog_path: String,
+    /// Days to retain learning-event log entries.
+    pub eventlog_retention_days: u64,
 }
 
 impl Default for SkillsConfig {
@@ -108,6 +112,8 @@ impl Default for SkillsConfig {
             curate_interval_secs: 600,
             proactive: false,
             proactive_interval_secs: 600,
+            eventlog_path: String::new(),
+            eventlog_retention_days: 7,
         }
     }
 }
@@ -198,6 +204,14 @@ impl SkillsConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(d.proactive_interval_secs);
+        let eventlog_path = env::var("ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+        let eventlog_retention_days = env::var("ANTHROPIC_PROXY_SKILLS_EVENTLOG_RETENTION_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d.eventlog_retention_days);
         SkillsConfig {
             enabled,
             qdrant_url,
@@ -218,6 +232,8 @@ impl SkillsConfig {
             curate_interval_secs,
             proactive,
             proactive_interval_secs,
+            eventlog_path,
+            eventlog_retention_days,
         }
     }
 }

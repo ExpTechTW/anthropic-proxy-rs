@@ -9,6 +9,7 @@
 use super::store;
 use crate::config::Config;
 use reqwest::Client;
+use serde_json::json;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -81,6 +82,9 @@ async fn run_once(config: &Config, client: &Client) {
     }
     if !deleted.is_empty() {
         tracing::info!(removed = deleted.len(), "skills/curate: dedup removed near-duplicates");
+    }
+    if dropped > 0 || !deleted.is_empty() {
+        super::eventlog::record("curate", json!({"dropped": dropped, "deduped": deleted.len()}));
     }
 }
 

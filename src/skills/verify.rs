@@ -73,12 +73,17 @@ async fn run_once(config: &Config, client: &Client) {
                             .await
                         {
                             tracing::info!(title = %p.title, "skills/verify: candidate -> verified");
+                            super::eventlog::record(
+                                "promote",
+                                json!({"tier": "verified", "title": p.title.clone()}),
+                            );
                         }
                     }
                     Some(false) => {
                         // Back off: stamp the attempt so we don't re-verify until the window passes.
                         qc.set_payload(id, json!({"verify_attempted_at": unix_now()})).await;
                         tracing::debug!(title = %p.title, "skills/verify: not corroborated; backing off");
+                        super::eventlog::record("reject", json!({"title": p.title.clone()}));
                     }
                     None => {} // transient (search/LLM unavailable) — retry next tick, no stamp
                 }
@@ -95,6 +100,7 @@ async fn run_once(config: &Config, client: &Client) {
                 .await
         {
             tracing::info!(title = %p.title, "skills/verify: verified -> trusted (soak passed)");
+            super::eventlog::record("promote", json!({"tier": "trusted", "title": p.title.clone()}));
         }
     }
 }

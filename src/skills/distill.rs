@@ -170,6 +170,14 @@ async fn distill(config: &Config, client: &Client, transcript: &str, api_key: Op
     }
     if written > 0 {
         tracing::info!(written, outcome = %judged.outcome, "skills/distill: wrote candidate lessons");
+        super::eventlog::record(
+            "distill",
+            json!({
+                "outcome": judged.outcome,
+                "written": written,
+                "skills": lessons.iter().map(|l| l.title.clone()).collect::<Vec<_>>(),
+            }),
+        );
     }
 }
 

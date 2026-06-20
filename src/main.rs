@@ -203,6 +203,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     let config = Arc::new(config);
 
+    // Compact, persistent learning-event log (no-op unless a path is configured).
+    skills::init_eventlog(&config);
+
     // Stage 3/4/5: background verification, curation, and proactive-learning loops
     // (each a no-op unless skills learning — and, for proactive, ANTHROPIC_PROXY_SKILLS_PROACTIVE — is on).
     skills::spawn_verify(config.clone(), client.clone());

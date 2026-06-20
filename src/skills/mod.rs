@@ -16,6 +16,7 @@
 mod curate;
 mod distill;
 mod embed;
+mod eventlog;
 mod llm;
 mod proactive;
 mod store;
@@ -27,6 +28,15 @@ pub use distill::maybe_spawn as maybe_spawn_distill;
 pub use verify::spawn as spawn_verify;
 pub use curate::spawn as spawn_curate;
 pub use proactive::{record_question, spawn as spawn_proactive};
+pub use eventlog::record as log_event;
+
+/// Start the compact learning-event log (no-op unless `ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH` set).
+pub fn init_eventlog(config: &Config) {
+    eventlog::init(
+        &config.skills.eventlog_path,
+        config.skills.eventlog_retention_days,
+    );
+}
 
 use crate::config::Config;
 use crate::models::anthropic;

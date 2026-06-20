@@ -47,6 +47,14 @@ pub async fn proxy_handler(
                 titles = %found.iter().map(|s| s.title.as_str()).collect::<Vec<_>>().join(" | "),
                 "skills: injected into request"
             );
+            skills::log_event(
+                "inject",
+                serde_json::json!({
+                    "n": ids.len(),
+                    "skills": found.iter().map(|s| s.title.clone()).collect::<Vec<_>>(),
+                    "top": found.iter().map(|s| s.score).fold(0.0_f32, f32::max),
+                }),
+            );
         }
         ids
     } else {
