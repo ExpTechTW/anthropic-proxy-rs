@@ -22,6 +22,7 @@ mod facts;
 mod eventlog;
 mod llm;
 mod proactive;
+mod reflect;
 mod store;
 mod verify;
 
@@ -37,6 +38,7 @@ pub use verify::spawn as spawn_verify;
 pub use curate::spawn as spawn_curate;
 pub use proactive::{record_question, spawn as spawn_proactive};
 pub use facts::spawn_validity as spawn_facts_validity;
+pub use reflect::spawn as spawn_reflect;
 pub use eventlog::record as log_event;
 
 /// Start the compact learning-event log (no-op unless `ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH` set).

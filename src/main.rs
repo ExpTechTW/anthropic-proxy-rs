@@ -213,6 +213,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     skills::spawn_curate(config.clone(), client.clone());
     skills::spawn_proactive(config.clone(), client.clone());
     skills::spawn_facts_validity(config.clone(), client.clone());
+    skills::spawn_reflect(config.clone(), client.clone());
 
     let cors = CorsLayer::new()
         .allow_origin(Any)

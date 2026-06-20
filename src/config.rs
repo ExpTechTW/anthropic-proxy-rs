@@ -93,10 +93,15 @@ pub struct SkillsConfig {
     /// Cache corroborated time-sensitive facts (versions, current state) into the facts store,
     /// each stamped with an observation time + volatility-derived half-life.
     pub facts: bool,
+    /// LLM-driven consolidation: merge paraphrase clusters of skills into one higher-level lesson
+    /// (runs off the existing store — no traffic/search — so it keeps the LLM busy even when idle).
+    pub reflect: bool,
     /// How often the proactive-learning loop runs (seconds).
     pub proactive_interval_secs: u64,
     /// How often the facts validity loop re-checks decayed facts (seconds).
     pub facts_validity_interval_secs: u64,
+    /// How often the reflection/consolidation loop runs (seconds).
+    pub reflect_interval_secs: u64,
     /// Path to a compact JSONL learning-event log (empty disables it). Persist via a volume.
     pub eventlog_path: String,
     /// Days to retain learning-event log entries.
@@ -134,8 +139,10 @@ impl Default for SkillsConfig {
             curate_interval_secs: 600,
             proactive: false,
             facts: false,
+            reflect: false,
             proactive_interval_secs: 600,
             facts_validity_interval_secs: 1800,
+            reflect_interval_secs: 600,
             eventlog_path: String::new(),
             eventlog_retention_days: 7,
             tools: false,
@@ -235,6 +242,9 @@ impl SkillsConfig {
         let facts = env::var("ANTHROPIC_PROXY_SKILLS_FACTS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let reflect = env::var("ANTHROPIC_PROXY_SKILLS_REFLECT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let proactive_interval_secs = env::var("ANTHROPIC_PROXY_SKILLS_PROACTIVE_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -243,6 +253,10 @@ impl SkillsConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(d.facts_validity_interval_secs);
+        let reflect_interval_secs = env::var("ANTHROPIC_PROXY_SKILLS_REFLECT_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d.reflect_interval_secs);
         let eventlog_path = env::var("ANTHROPIC_PROXY_SKILLS_EVENTLOG_PATH")
             .ok()
             .map(|v| v.trim().to_string())
@@ -281,9 +295,11 @@ impl SkillsConfig {
             curate_interval_secs,
             proactive,
             facts,
+            reflect,
             facts_collection,
             proactive_interval_secs,
             facts_validity_interval_secs,
+            reflect_interval_secs,
             eventlog_path,
             eventlog_retention_days,
             tools,
