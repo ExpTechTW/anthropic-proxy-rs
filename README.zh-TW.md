@@ -317,7 +317,8 @@ tail -f /tmp/anthropic-proxy.log    # 日誌
     image: qdrant/qdrant
   embeddings:                       # OpenAI 相容 /v1/embeddings(多語 bge-m3)
     image: ghcr.io/ggml-org/llama.cpp:server
-    command: ["-hf","gpustack/bge-m3-GGUF:Q4_K_M","--embeddings","--pooling","cls","--host","0.0.0.0","--port","8080"]
+    command: ["-hf","gpustack/bge-m3-GGUF:Q4_K_M","--embeddings","--pooling","cls","-c","8192","-ub","8192","--host","0.0.0.0","--port","8080"]
+    # -ub 8192 讓它能把整段輸入塞進一個 physical batch 做 embedding;沒設的話超過預設 512 token 會回 500。
   anthropic-proxy:
     environment:
       ANTHROPIC_PROXY_SKILLS_ENABLED: "true"
