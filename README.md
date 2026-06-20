@@ -368,9 +368,10 @@ Example (Docker Compose) — co-located Qdrant + a llama.cpp embedding server, w
     image: qdrant/qdrant
   embeddings:                       # OpenAI-compatible /v1/embeddings (multilingual bge-m3)
     image: ghcr.io/ggml-org/llama.cpp:server
-    command: ["-hf","gpustack/bge-m3-GGUF:Q4_K_M","--embeddings","--pooling","cls","-c","8192","-ub","8192","--host","0.0.0.0","--port","8080"]
-    # -ub 8192 lets it embed inputs up to the context in one physical batch; without it llama.cpp
-    # returns 500 on inputs over the default 512-token batch.
+    command: ["-hf","gpustack/bge-m3-GGUF:Q4_K_M","--embeddings","--pooling","cls","-c","8192","-ub","2048","--host","0.0.0.0","--port","8080"]
+    # -ub sets the physical batch — and the compute-buffer memory. The default 512 is too small
+    # (llama.cpp 500s on inputs over ~512 tokens); 2048 covers typical inputs at a modest cost.
+    # Avoid large values like 8192 — they allocate multiple GB of compute buffer.
   anthropic-proxy:
     environment:
       ANTHROPIC_PROXY_SKILLS_ENABLED: "true"
