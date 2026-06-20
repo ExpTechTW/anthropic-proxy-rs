@@ -17,6 +17,7 @@ High-performance Rust proxy that translates the **Anthropic Messages API** into 
 - **Universal** — any OpenAI-compatible API (OpenRouter, OpenAI, Azure, local LLMs)
 - **Extended thinking** — detects Claude's reasoning mode and routes models accordingly
 - **Web search & fetch** — emulates Anthropic's server-side `web_search` / `web_fetch` for models that can't browse, via a bundled [open-websearch](https://github.com/aas-ee/open-websearch)
+- **Self-learning skills** *(optional, off by default)* — learns reusable lessons from the conversations it serves, web-verifies them through a trust gate, and injects relevant ones into future requests (Qdrant-backed, no fine-tuning). See [Self-learning skills](#self-learning-skills)
 - **Resilient** — retries transient failures, preserves upstream status codes, 600 s request timeout
 - **Drop-in** — works with the official Anthropic SDKs and Claude Code
 
@@ -293,6 +294,66 @@ The provided [`Dockerfile`](Dockerfile) / [`Dockerfile.source`](Dockerfile.sourc
 ### Egress-proxy rotation (optional)
 
 To spread searches across multiple source IPs and avoid single-IP rate-limiting, mount a proxy-list file at `/etc/websearch-ssh-proxies.txt` — one `user@host[:port] password` per line (`#` comments allowed). The container opens an SSH SOCKS tunnel per host (auto-reconnecting) and fronts them with [glider](https://github.com/nadoo/glider) (round-robin + health checks) as a single HTTP proxy that open-websearch routes through. With no file mounted, searches go out directly. Keep this file outside the build context and out of version control — it holds credentials.
+
+## Self-learning skills
+
+An optional, default-off layer that lets the proxy **learn reusable lessons from the conversations it serves and inject relevant learned knowledge into future requests** — transparently to the client, and best-effort so a failure can never break a proxied request. Inspired by skill-library / experiential-learning agents (Voyager, ReasoningBank, ExpeL).
+
+Knowledge lives in an external **[Qdrant](https://qdrant.tech)** vector store (no model fine-tuning), and every entry carries a **trust tier** — only `verified`/`trusted` ones are ever injected. The pipeline:
+
+1. **Inject** *(on the request path)* — embed the user's latest message, retrieve the top-k most relevant `verified`/`trusted` skills, and append them as a system block. Injected skill ids are surfaced in an `x-injected-skills` response header.
+2. **Distil** *(background)* — after a conversation, an LLM judge labels the outcome (success/failure, strict: absence of a complaint is **not** success) and extracts ≤3 general, reusable lessons (learning from both success and failure), written as `candidate` — never injectable.
+3. **Verify** *(background loop)* — each candidate is corroborated against the open web by a *quarantined* reader (treats results as untrusted data, no tools); promotion to `verified` requires a positive verdict **and** independent multi-source corroboration (not the model's own confidence), then to `trusted` after a soak period.
+4. **Curate** *(background loop)* — drop unverified candidates past the retention window and collapse near-duplicate entries, keeping the store small and high-signal.
+5. **Proactive** *(background loop, opt-in)* — record the questions users actually ask, then research recent ones on the web and distil candidates, so the store grows toward what's needed.
+
+Everything is non-parametric — "learning" is writing rows to Qdrant — and every background task runs off the request path, so the latency and reliability of normal requests are unaffected.
+
+**Requirements:** a reachable Qdrant, an OpenAI-compatible **embeddings** endpoint (e.g. a small multilingual model served by [llama.cpp](https://github.com/ggml-org/llama.cpp) or Ollama), and a chat endpoint for the background learning LLM (defaults to the upstream; point `ANTHROPIC_PROXY_SKILLS_LLM_URL` at a no-auth internal backend to avoid spending a client key / user quota). Verification reuses the bundled open-websearch.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ANTHROPIC_PROXY_SKILLS_ENABLED` | `false` | Master switch for **injection** (the read path) |
+| `ANTHROPIC_PROXY_SKILLS_LEARN` | `false` | Enable the **learning** background loops (distil + verify + curate) |
+| `ANTHROPIC_PROXY_SKILLS_PROACTIVE` | `false` | Enable **proactive** research of asked questions (requires `LEARN`) |
+| `ANTHROPIC_PROXY_SKILLS_QDRANT_URL` | `http://qdrant:6333` | Qdrant base URL |
+| `ANTHROPIC_PROXY_SKILLS_COLLECTION` | `skills` | Qdrant collection name |
+| `ANTHROPIC_PROXY_SKILLS_EMBED_URL` | upstream `/embeddings` | OpenAI-compatible embeddings endpoint |
+| `ANTHROPIC_PROXY_SKILLS_EMBED_MODEL` | – | Embedding model name (empty disables retrieval) |
+| `ANTHROPIC_PROXY_SKILLS_LLM_URL` | upstream chat URL | Chat endpoint for background learning calls; when set, called with **no auth** |
+| `ANTHROPIC_PROXY_SKILLS_LLM_MODEL` | `auto` | Model for the background learning/judge calls |
+| `ANTHROPIC_PROXY_SKILLS_API_KEY` | – | Key for background calls not tied to a client request (falls back to the last-seen client key) |
+| `ANTHROPIC_PROXY_SKILLS_TOP_K` | `3` | Max skills injected per request |
+| `ANTHROPIC_PROXY_SKILLS_MIN_SCORE` | `0.5` | Minimum cosine score to inject (filters weak matches; ~`0.45` suits bge-m3) |
+| `ANTHROPIC_PROXY_SKILLS_INJECT_TIERS` | `verified,trusted` | Tiers eligible for injection (candidates excluded) |
+| `ANTHROPIC_PROXY_SKILLS_VERIFY_INTERVAL_SECS` | `300` | Verification-loop interval |
+| `ANTHROPIC_PROXY_SKILLS_SOAK_SECS` | `1209600` | Soak before `verified` → `trusted` (default 14 days) |
+| `ANTHROPIC_PROXY_SKILLS_CURATE_INTERVAL_SECS` | `600` | Curation-loop interval |
+| `ANTHROPIC_PROXY_SKILLS_PROACTIVE_INTERVAL_SECS` | `600` | Proactive-loop interval |
+| `ANTHROPIC_PROXY_SKILLS_RETENTION_DAYS` | `30` | Drop unverified candidates older than this |
+
+> **Safety.** Learning from the open web is a documented poisoning vector, so the trust gate is the load-bearing control: unverified knowledge is never injected, promotion requires independent multi-source corroboration rather than the model's confidence, and the web-reading LLM is quarantined (no tools / no write access). Treat your embeddings / LLM / Qdrant endpoints as trusted infrastructure.
+
+Example (Docker Compose) — co-located Qdrant + a llama.cpp embedding server, with learning routed at a no-auth internal backend:
+
+```yaml
+  qdrant:
+    image: qdrant/qdrant
+  embeddings:                       # OpenAI-compatible /v1/embeddings (multilingual bge-m3)
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command: ["-hf","gpustack/bge-m3-GGUF:Q4_K_M","--embeddings","--pooling","cls","--host","0.0.0.0","--port","8080"]
+  anthropic-proxy:
+    environment:
+      ANTHROPIC_PROXY_SKILLS_ENABLED: "true"
+      ANTHROPIC_PROXY_SKILLS_LEARN: "true"
+      ANTHROPIC_PROXY_SKILLS_PROACTIVE: "true"
+      ANTHROPIC_PROXY_SKILLS_QDRANT_URL: "http://qdrant:6333"
+      ANTHROPIC_PROXY_SKILLS_EMBED_URL: "http://embeddings:8080/v1/embeddings"
+      ANTHROPIC_PROXY_SKILLS_EMBED_MODEL: "bge-m3"
+      ANTHROPIC_PROXY_SKILLS_LLM_URL: "http://your-backend:8000/v1/chat/completions"
+      ANTHROPIC_PROXY_SKILLS_LLM_MODEL: "your-model"
+      ANTHROPIC_PROXY_SKILLS_MIN_SCORE: "0.45"
+```
 
 ## Supported Features
 

@@ -16,6 +16,7 @@
 - **工具呼叫** — function/tool calling,含 `tool_choice`
 - **通用** — 任何 OpenAI 相容 API(OpenRouter、OpenAI、Azure、本機 LLM)
 - **延伸思考** — 偵測 Claude 的 reasoning 模式並據此切換模型
+- **自我學習技能**(選用,預設關閉)— 從服務過的對話學到可重用的教訓,經 web 查證與信任分層,把相關的注入後續請求(Qdrant 儲存、不需 fine-tune)。見[自我學習技能](#自我學習技能)
 - **穩定可靠** — 暫時性錯誤自動重試、保留上游狀態碼、600 秒請求逾時
 - **即插即用** — 相容官方 Anthropic SDK 與 Claude Code
 
@@ -268,6 +269,66 @@ anthropic-proxy --daemon            # 啟動
 anthropic-proxy status              # 檢查
 anthropic-proxy stop                # 停止
 tail -f /tmp/anthropic-proxy.log    # 日誌
+```
+
+## 自我學習技能
+
+選用、預設關閉的一層,讓 proxy **從服務過的對話學到可重用的教訓,並把相關的學習知識注入後續請求**——對 client 透明,且全程 best-effort,任何失敗都不會中斷被代理的請求。靈感來自技能庫／經驗學習型 agent(Voyager、ReasoningBank、ExpeL)。
+
+知識存在外部 **[Qdrant](https://qdrant.tech)** 向量庫(不需 fine-tune),每筆都帶**信任分層**——只有 `verified`/`trusted` 會被注入。流程:
+
+1. **注入**(請求路徑上)— 把使用者最後一則訊息做 embedding,取出最相關的前 k 筆 `verified`/`trusted` 技能,以 system block 附加;注入的技能 id 會回在 `x-injected-skills` 標頭。
+2. **蒸餾**(背景)— 對話後由 LLM 評判結果(成功/失敗,從嚴:沒有抱怨**不等於**成功),萃取 ≤3 條通用、可重用的教訓(成功與失敗都學),寫成 `candidate`(不可注入)。
+3. **驗證**(背景迴圈)— 每個 candidate 由**隔離的**讀取器(把搜尋結果當不可信資料、無工具)對開放網路查證;升級為 `verified` 需要正面判定**且**多個獨立來源佐證(而非模型自信),再經 soak 期升 `trusted`。
+4. **策展**(背景迴圈)— 淘汰過保留期的未驗證 candidate、合併近似重複,使知識庫精簡高訊號。
+5. **主動學習**(背景迴圈,選用)— 記錄使用者實際問的問題,定期上網研究並蒸餾成 candidate,讓知識庫往真正需要的方向長。
+
+整套是非參數化的——「學習」就是寫 row 進 Qdrant——而且所有背景工作都在請求路徑外,正常請求的延遲與穩定性完全不受影響。
+
+**前置需求:** 可連線的 Qdrant、一個 OpenAI 相容的 **embeddings** 端點(例如以 [llama.cpp](https://github.com/ggml-org/llama.cpp) 或 Ollama 服務的小型多語模型),以及背景學習 LLM 的 chat 端點(預設用上游;把 `ANTHROPIC_PROXY_SKILLS_LLM_URL` 指向免認證的內部 backend,可避免耗用 client key／用戶額度)。驗證沿用內建的 open-websearch。
+
+| 變數 | 預設 | 說明 |
+|------|------|------|
+| `ANTHROPIC_PROXY_SKILLS_ENABLED` | `false` | **注入**(讀取路徑)總開關 |
+| `ANTHROPIC_PROXY_SKILLS_LEARN` | `false` | 啟用**學習**背景迴圈(蒸餾＋驗證＋策展) |
+| `ANTHROPIC_PROXY_SKILLS_PROACTIVE` | `false` | 啟用**主動**研究被問的問題(需 `LEARN`) |
+| `ANTHROPIC_PROXY_SKILLS_QDRANT_URL` | `http://qdrant:6333` | Qdrant base URL |
+| `ANTHROPIC_PROXY_SKILLS_COLLECTION` | `skills` | Qdrant collection 名稱 |
+| `ANTHROPIC_PROXY_SKILLS_EMBED_URL` | 上游 `/embeddings` | OpenAI 相容 embeddings 端點 |
+| `ANTHROPIC_PROXY_SKILLS_EMBED_MODEL` | – | embedding 模型名(空字串停用檢索) |
+| `ANTHROPIC_PROXY_SKILLS_LLM_URL` | 上游 chat URL | 背景學習呼叫的 chat 端點;設定後以**免認證**呼叫 |
+| `ANTHROPIC_PROXY_SKILLS_LLM_MODEL` | `auto` | 背景學習／評判用模型 |
+| `ANTHROPIC_PROXY_SKILLS_API_KEY` | – | 非請求觸發的背景呼叫用 key(否則回退到最近一次 client key) |
+| `ANTHROPIC_PROXY_SKILLS_TOP_K` | `3` | 每次請求最多注入幾筆 |
+| `ANTHROPIC_PROXY_SKILLS_MIN_SCORE` | `0.5` | 注入的最低 cosine 分數(過濾弱匹配;bge-m3 建議約 `0.45`) |
+| `ANTHROPIC_PROXY_SKILLS_INJECT_TIERS` | `verified,trusted` | 可被注入的層級(排除 candidate) |
+| `ANTHROPIC_PROXY_SKILLS_VERIFY_INTERVAL_SECS` | `300` | 驗證迴圈間隔 |
+| `ANTHROPIC_PROXY_SKILLS_SOAK_SECS` | `1209600` | `verified` → `trusted` 的 soak 期(預設 14 天) |
+| `ANTHROPIC_PROXY_SKILLS_CURATE_INTERVAL_SECS` | `600` | 策展迴圈間隔 |
+| `ANTHROPIC_PROXY_SKILLS_PROACTIVE_INTERVAL_SECS` | `600` | 主動學習迴圈間隔 |
+| `ANTHROPIC_PROXY_SKILLS_RETENTION_DAYS` | `30` | 淘汰超過此天數的未驗證 candidate |
+
+> **安全。** 從開放網路學習是已知的中毒風險,所以信任分層是承重控制:未驗證知識絕不注入、升級需多個獨立來源佐證(而非模型自信)、讀網頁的 LLM 被隔離(無工具／無寫入)。請把你的 embeddings／LLM／Qdrant 端點視為可信基礎設施。
+
+範例(Docker Compose)— 同址 Qdrant + llama.cpp embedding server,學習導向免認證的內部 backend:
+
+```yaml
+  qdrant:
+    image: qdrant/qdrant
+  embeddings:                       # OpenAI 相容 /v1/embeddings(多語 bge-m3)
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command: ["-hf","gpustack/bge-m3-GGUF:Q4_K_M","--embeddings","--pooling","cls","--host","0.0.0.0","--port","8080"]
+  anthropic-proxy:
+    environment:
+      ANTHROPIC_PROXY_SKILLS_ENABLED: "true"
+      ANTHROPIC_PROXY_SKILLS_LEARN: "true"
+      ANTHROPIC_PROXY_SKILLS_PROACTIVE: "true"
+      ANTHROPIC_PROXY_SKILLS_QDRANT_URL: "http://qdrant:6333"
+      ANTHROPIC_PROXY_SKILLS_EMBED_URL: "http://embeddings:8080/v1/embeddings"
+      ANTHROPIC_PROXY_SKILLS_EMBED_MODEL: "bge-m3"
+      ANTHROPIC_PROXY_SKILLS_LLM_URL: "http://your-backend:8000/v1/chat/completions"
+      ANTHROPIC_PROXY_SKILLS_LLM_MODEL: "your-model"
+      ANTHROPIC_PROXY_SKILLS_MIN_SCORE: "0.45"
 ```
 
 ## 支援功能
