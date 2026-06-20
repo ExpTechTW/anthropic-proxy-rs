@@ -4,6 +4,7 @@ mod error;
 mod metrics;
 mod models;
 mod proxy;
+mod searx;
 mod skills;
 mod translate;
 mod websearch;

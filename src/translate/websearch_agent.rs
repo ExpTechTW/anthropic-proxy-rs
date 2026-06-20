@@ -19,6 +19,7 @@
 use crate::config::Config;
 use crate::error::{ProxyError, ProxyResult};
 use crate::models::{anthropic, openai};
+use crate::searx::SearxClient;
 use crate::websearch::{FetchResult, SearchResult, WebSearchClient};
 use axum::{
     body::Body,
@@ -305,6 +306,13 @@ async fn run_loop(
     openai_req.reasoning_effort = Some(AGENT_EFFORT.to_string());
 
     let ws = WebSearchClient::new(config.websearch_url.clone(), client.clone());
+    // When a SearXNG instance is configured, run `web_search` through it (70+ engines, deduped);
+    // `web_fetch` always stays on open-websearch (SearXNG has no page fetch). A SearXNG error
+    // falls back to open-websearch search so the feature degrades gracefully.
+    let searx = config
+        .searxng_url
+        .as_ref()
+        .map(|u| SearxClient::new(u.clone(), client.clone()));
     let mut messages = openai_req.messages.clone();
     // The loop is mechanical (decide → search → summarize); chain-of-thought just adds large
     // latency (a toolless answer round was observed generating 4.6K think tokens / 85s). Disable
@@ -472,6 +480,7 @@ async fn run_loop(
         // Run the (non-over-budget) calls concurrently.
         let executed = futures::future::join_all(plans.iter().map(|p| {
             let ws = &ws;
+            let searx = searx.as_ref();
             async move {
                 if p.over_budget {
                     return None;
@@ -479,11 +488,23 @@ async fn run_loop(
                 let t = Instant::now();
                 Some(match p.kind {
                     WebKind::Search => {
-                        let engines = [SEARCH_ENGINE.to_string()];
-                        CallResult::Search(
-                            ws.search(&p.arg, SEARCH_LIMIT, &engines, SEARCH_MODE).await,
-                            t.elapsed(),
-                        )
+                        let result = match searx {
+                            Some(sx) => match sx.search(&p.arg, SEARCH_LIMIT).await {
+                                Ok(r) => Ok(r),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "web agent: searxng failed ({e}); falling back to open-websearch"
+                                    );
+                                    let engines = [SEARCH_ENGINE.to_string()];
+                                    ws.search(&p.arg, SEARCH_LIMIT, &engines, SEARCH_MODE).await
+                                }
+                            },
+                            None => {
+                                let engines = [SEARCH_ENGINE.to_string()];
+                                ws.search(&p.arg, SEARCH_LIMIT, &engines, SEARCH_MODE).await
+                            }
+                        };
+                        CallResult::Search(result, t.elapsed())
                     }
                     WebKind::Fetch => {
                         CallResult::Fetch(ws.fetch(&p.arg, FETCH_MAX_CHARS).await, t.elapsed())

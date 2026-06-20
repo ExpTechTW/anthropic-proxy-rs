@@ -61,7 +61,7 @@ services:
       # authed/metered upstream with a dedicated key for separate accounting (uncomment API_KEY).
       ANTHROPIC_PROXY_SKILLS_LLM_URL: "http://your-backend/v1/chat/completions"
       ANTHROPIC_PROXY_SKILLS_LLM_MODEL: "your-model"
-      # ANTHROPIC_PROXY_SKILLS_API_KEY: "sk-..."  # sent to LLM_URL when both are set
+      ANTHROPIC_PROXY_SKILLS_API_KEY: "sk-your-key"  # sent to LLM_URL; leave blank for a no-auth backend
       # docs: push-inject for libraries named in the query (streaming preserved).
       # Prefer this over the pull tool loop (ANTHROPIC_PROXY_SKILLS_TOOLS=true), which buffers.
       ANTHROPIC_PROXY_SKILLS_DOCS_MCP_URL: "http://docs-mcp:6280/mcp"

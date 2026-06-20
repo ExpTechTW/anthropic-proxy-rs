@@ -34,6 +34,10 @@ pub struct Config {
     /// agent id", e.g. `auto`). `None` (env unset) disables emulation entirely: the web tools
     /// are stripped and the client gets an empty result instead of a real search.
     pub websearch_model: Option<String>,
+    /// Base URL of a self-hosted SearXNG instance (e.g. `http://searxng:8080`). When set, the
+    /// web-search agent runs `web_search` through SearXNG's JSON API (70+ engines, deduped)
+    /// instead of open-websearch; `web_fetch` still uses open-websearch. `None` → open-websearch.
+    pub searxng_url: Option<String>,
     /// Self-learning skill-injection settings (read path; see [`crate::skills`]).
     pub skills: SkillsConfig,
 }
@@ -62,14 +66,15 @@ pub struct SkillsConfig {
     pub learn: bool,
     /// Model for background learning LLM calls (distil/judge/verify). Default `auto`.
     pub llm_model: String,
-    /// API key for background LLM/embedding calls not tied to a client request (verification,
-    /// proactive study). Falls back to the last-seen client key when unset (passthrough mode).
+    /// API key for background LLM/embedding calls not tied to a client request (distillation,
+    /// verification, proactive study). When `llm_url` is set this key is sent to it as a bearer;
+    /// otherwise it authes the upstream fallback. Falls back to the last-seen client key when unset.
     pub api_key: Option<String>,
     /// Retention for unverified candidates (days) before curation drops them.
     pub retention_days: u32,
-    /// Chat endpoint for background learning LLM calls. When set, calls go here with NO auth
-    /// (e.g. a no-auth internal backend), so background tasks need no client key; unset uses the
-    /// authed upstream + client key.
+    /// Chat endpoint for background learning LLM calls. When set, calls go here with `api_key` as a
+    /// bearer if that is set (e.g. an authed/metered upstream), else with no auth (e.g. a no-auth
+    /// internal backend); unset uses the authed upstream + the client key.
     pub llm_url: Option<String>,
     /// How often the verification/promotion loop runs (seconds).
     pub verify_interval_secs: u64,
@@ -282,6 +287,7 @@ impl Default for Config {
             heartbeat_secs: 15,
             websearch_url: "http://localhost:3100/mcp".to_string(),
             websearch_model: None,
+            searxng_url: None,
             skills: SkillsConfig::default(),
         }
     }
@@ -490,6 +496,11 @@ impl Config {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
 
+        let searxng_url = env::var("ANTHROPIC_PROXY_SEARXNG_URL")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty());
+
         let skills = SkillsConfig::from_env();
 
         // Validate: UPSTREAM_API_KEY_PASSTHROUGH requires UPSTREAM_API_KEY to be unset
@@ -519,6 +530,7 @@ impl Config {
             heartbeat_secs,
             websearch_url,
             websearch_model,
+            searxng_url,
             skills,
         })
     }
