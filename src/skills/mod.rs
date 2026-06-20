@@ -13,9 +13,11 @@
 //! large store must not flood the prompt — over-injection degrades quality), and graceful
 //! degradation everywhere.
 
+mod curate;
 mod distill;
 mod embed;
 mod llm;
+mod proactive;
 mod store;
 mod verify;
 
@@ -23,6 +25,8 @@ mod verify;
 pub use store::{stable_id, QdrantClient};
 pub use distill::maybe_spawn as maybe_spawn_distill;
 pub use verify::spawn as spawn_verify;
+pub use curate::spawn as spawn_curate;
+pub use proactive::{record_question, spawn as spawn_proactive};
 
 use crate::config::Config;
 use crate::models::anthropic;

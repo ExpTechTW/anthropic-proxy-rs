@@ -84,6 +84,26 @@ struct ScrollPoint {
     payload: SkillPayload,
 }
 
+#[derive(Deserialize)]
+struct ScrollVecResponse {
+    result: ScrollVecResult,
+}
+
+#[derive(Deserialize)]
+struct ScrollVecResult {
+    #[serde(default)]
+    points: Vec<ScrollVecPoint>,
+}
+
+#[derive(Deserialize)]
+struct ScrollVecPoint {
+    id: Value,
+    #[serde(default)]
+    payload: SkillPayload,
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
+}
+
 /// Decode a Qdrant point id (we always write u64 ids) back to u64.
 fn id_as_u64(v: &Value) -> Option<u64> {
     match v {
@@ -206,8 +226,40 @@ impl QdrantClient {
         )
     }
 
+    /// Scroll up to `limit` points across all tiers WITH their vectors — used by curation's
+    /// semantic dedup. Best-effort: empty on failure.
+    pub async fn scroll_all_with_vectors(&self, limit: u32) -> Vec<(u64, SkillPayload, Vec<f32>)> {
+        let url = format!("{}/collections/{}/points/scroll", self.base, self.collection);
+        let body = json!({ "limit": limit, "with_payload": true, "with_vector": true });
+        let Ok(resp) = self
+            .http
+            .post(&url)
+            .timeout(QDRANT_TIMEOUT)
+            .json(&body)
+            .send()
+            .await
+        else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(parsed) = resp.json::<ScrollVecResponse>().await else {
+            return Vec::new();
+        };
+        parsed
+            .result
+            .points
+            .into_iter()
+            .filter_map(|p| {
+                let id = id_as_u64(&p.id)?;
+                let vector = p.vector?;
+                Some((id, p.payload, vector))
+            })
+            .collect()
+    }
+
     /// Delete one point by id (used by curation/retention).
-    #[allow(dead_code)]
     pub async fn delete(&self, id: u64) -> bool {
         let url = format!("{}/collections/{}/points/delete?wait=true", self.base, self.collection);
         let body = json!({ "points": [id] });

@@ -29,11 +29,16 @@ pub async fn proxy_handler(
     let api_key = resolve_api_key(&config, &headers);
     skills::remember_api_key(api_key.as_deref());
 
+    let user_text = skills::last_user_text(&req).unwrap_or_default();
+    // Stage 5: record the asked question for proactive research (no-op unless proactive enabled).
+    if config.skills.proactive {
+        skills::record_question(&user_text);
+    }
+
     // Auto-inject relevant learned skills (Stage 1). Best-effort: embedding/Qdrant failures
     // return no skills and the request proceeds untouched, so the feature can never break a call.
     let injected_skills = if config.skills.enabled {
-        let query = skills::last_user_text(&req).unwrap_or_default();
-        let found = skills::retrieve(&config, &client, &query, api_key.as_deref()).await;
+        let found = skills::retrieve(&config, &client, &user_text, api_key.as_deref()).await;
         let ids = skills::inject(&mut req, &found);
         if !ids.is_empty() {
             tracing::info!(

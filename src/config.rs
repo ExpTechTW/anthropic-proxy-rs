@@ -75,6 +75,12 @@ pub struct SkillsConfig {
     pub verify_interval_secs: u64,
     /// How long a `verified` entry must soak before it can become `trusted` (seconds).
     pub soak_secs: u64,
+    /// How often the curation loop (retention + dedup) runs (seconds).
+    pub curate_interval_secs: u64,
+    /// Enable proactive learning (research recent asked questions into candidates).
+    pub proactive: bool,
+    /// How often the proactive-learning loop runs (seconds).
+    pub proactive_interval_secs: u64,
 }
 
 impl Default for SkillsConfig {
@@ -95,6 +101,9 @@ impl Default for SkillsConfig {
             llm_url: None,
             verify_interval_secs: 300,
             soak_secs: 14 * 24 * 60 * 60,
+            curate_interval_secs: 600,
+            proactive: false,
+            proactive_interval_secs: 600,
         }
     }
 }
@@ -170,6 +179,17 @@ impl SkillsConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(d.soak_secs);
+        let curate_interval_secs = env::var("ANTHROPIC_PROXY_SKILLS_CURATE_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d.curate_interval_secs);
+        let proactive = env::var("ANTHROPIC_PROXY_SKILLS_PROACTIVE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let proactive_interval_secs = env::var("ANTHROPIC_PROXY_SKILLS_PROACTIVE_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d.proactive_interval_secs);
         SkillsConfig {
             enabled,
             qdrant_url,
@@ -186,6 +206,9 @@ impl SkillsConfig {
             llm_url,
             verify_interval_secs,
             soak_secs,
+            curate_interval_secs,
+            proactive,
+            proactive_interval_secs,
         }
     }
 }
