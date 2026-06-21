@@ -82,6 +82,14 @@ struct Judgement {
     outcome: String,
     #[serde(default)]
     lessons: Vec<Lesson>,
+    /// One-line topic summary of the conversation (observability only).
+    #[serde(default)]
+    summary: String,
+    /// Specific, researchable topics/technologies the user engaged with — fed into the proactive
+    /// queue so the background loop learns "what users are interested in" (richer than the raw last
+    /// question). Empty when nothing is worth researching.
+    #[serde(default)]
+    interests: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -107,8 +115,11 @@ and a later attempt SUCCEEDED: distil the corrected usage into a 'how to use it 
 — state the right form and the pitfall it avoids (kind=positive). Keep every lesson GENERAL and \
 transferable: never include secrets, credentials, file contents, names, paths, or other task-specific \
 details. Be conservative: if the conversation is trivial, off-topic, or you cannot tell, return an empty \
-lessons array. Output STRICT JSON only, no prose: \
-{\"outcome\":\"success|failure|unclear\",\"lessons\":[{\"title\":\"\",\"when_to_use\":\"short trigger phrase\",\"body\":\"actionable lesson\",\"kind\":\"positive|negative\"}]}";
+lessons array. (3) Write a one-line 'summary' of the topic, and list up to 3 'interests' — SPECIFIC, \
+researchable topics or technologies the user engaged with (e.g. 'latest Bun version', 'Rust async \
+cancellation'), suitable for later background web research; leave 'interests' empty if nothing is worth \
+researching (small talk, purely local edits). Output STRICT JSON only, no prose: \
+{\"outcome\":\"success|failure|unclear\",\"summary\":\"one line\",\"interests\":[\"researchable topic\"],\"lessons\":[{\"title\":\"\",\"when_to_use\":\"short trigger phrase\",\"body\":\"actionable lesson\",\"kind\":\"positive|negative\"}]}";
 
 async fn distill(config: &Config, client: &Client, transcript: &str, api_key: Option<&str>) {
     let user = format!("Transcript:\n{transcript}\n\nReturn the JSON now.");
@@ -126,6 +137,33 @@ async fn distill(config: &Config, client: &Client, transcript: &str, api_key: Op
             return;
         }
     };
+
+    // Feed researchable interests from this conversation into the proactive queue — a richer signal
+    // than the raw last question, so the background loop learns "what users are interested in". Done
+    // before the no-lessons early-return, so even a chat with no distillable lesson surfaces topics.
+    let interests: Vec<String> = judged
+        .interests
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .take(3)
+        .collect();
+    if config.skills.proactive {
+        for topic in &interests {
+            super::proactive::record_question(topic);
+        }
+    }
+    if !judged.summary.trim().is_empty() || !interests.is_empty() {
+        super::eventlog::record(
+            "summary",
+            json!({
+                "summary": judged.summary.trim(),
+                "interests": interests,
+                "outcome": judged.outcome,
+            }),
+        );
+    }
+
     let lessons: Vec<Lesson> = judged
         .lessons
         .into_iter()
