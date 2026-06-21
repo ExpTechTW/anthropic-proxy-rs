@@ -69,6 +69,12 @@ pub struct FactPayload {
     /// finds the SAME value (proven stable → trust longer, re-check less), resets when it changes.
     #[serde(default)]
     pub stability: Option<f32>,
+    /// Provenance: "proactive" (web-learned) or "manual" (user-asserted). A manual fact is
+    /// authoritative — web research never overwrites it, the validity loop skips it, and it always
+    /// injects (no freshness decay). For facts the public web gets wrong/lacks (e.g. a very new or
+    /// internal version), the domain expert is the source of truth, not noisy search.
+    #[serde(default)]
+    pub source: String,
 }
 
 #[derive(Deserialize)]
@@ -193,6 +199,11 @@ pub async fn maybe_learn_fact(config: &Config, client: &Client, question: &str) 
             qc.delete(h.id).await; // collapse a further duplicate of the same subject
         }
     }
+    // A user-asserted fact is authoritative — never clobber it with (possibly wrong) web research.
+    if prior.as_ref().is_some_and(|p| p.source == "manual") {
+        tracing::debug!(subject = %f.subject, "skills/facts: keeping manual fact, skipping web overwrite");
+        return;
+    }
     // Adaptive half-life: if this is a re-check of an existing fact, grow stability when the value is
     // unchanged (proven stable → trust longer) and reset it when the value moved. Fresh facts start
     // at 1.0. This learns the real change rate instead of trusting a one-shot LLM TTL guess.
@@ -259,6 +270,10 @@ pub async fn relevant_facts(config: &Config, client: &Client, query: &str) -> Op
         .into_iter()
         .filter_map(|h| {
             let f: FactPayload = serde_json::from_value(h.payload).ok()?;
+            // A user-asserted fact is authoritative: always eligible, treated as perfectly fresh.
+            if f.source == "manual" {
+                return Some((h.score, f));
+            }
             if f.valid_until.is_some_and(|vu| now >= vu) {
                 return None; // past its hard expiry — known stale, never inject
             }
@@ -371,6 +386,9 @@ async fn run_validity(config: &Config, client: &Client) {
             Ok(f) => f,
             Err(_) => continue,
         };
+        if f.source == "manual" {
+            continue; // user-asserted: authoritative, never auto-re-checked/overwritten
+        }
         let observed = f.observed_at.unwrap_or(now);
         // Effective half-life folds in the adaptive stability multiplier (stable facts re-check less).
         let half = (f.half_life_secs.unwrap_or(DEFAULT_HALF_LIFE) as f32
@@ -429,8 +447,12 @@ async fn dedup_facts(config: &Config, client: &Client, qc: &store::QdrantClient)
             if !same_subject(config, client, &fi.subject, &fj.subject).await {
                 continue;
             }
-            // Keep the fresher observation; delete the staler duplicate.
-            let i_fresher = fi.observed_at.unwrap_or(0) >= fj.observed_at.unwrap_or(0);
+            // Keep a user-asserted fact over a web one; otherwise keep the fresher observation.
+            let i_fresher = match (fi.source == "manual", fj.source == "manual") {
+                (true, false) => true,
+                (false, true) => false,
+                _ => fi.observed_at.unwrap_or(0) >= fj.observed_at.unwrap_or(0),
+            };
             let (drop_id, dropped, kept) = if i_fresher {
                 (facts[j].0, fj.subject.clone(), fi.subject.clone())
             } else {
