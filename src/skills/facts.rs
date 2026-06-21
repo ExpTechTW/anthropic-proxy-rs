@@ -25,6 +25,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const FACT_MAX_TOKENS: u32 = 2048;
 const MIN_DOMAINS: usize = 2; // independent corroborating hosts before we cache a value
 const MIN_CONFIDENCE: f32 = 0.6;
+/// Gather near-subject facts above this score; the LLM then confirms whether they're truly the
+/// same subject before overwriting/collapsing (cosine alone over-merges "latest X" templates).
+const FACT_DEDUP_THRESHOLD: f32 = 0.80;
 const FACTS_SCROLL: u32 = 300;
 const DEFAULT_HALF_LIFE: u64 = 30 * 86_400;
 
@@ -141,7 +144,26 @@ pub async fn maybe_learn_fact(config: &Config, client: &Client, question: &str) 
         return;
     }
     let now = unix_now();
-    let id = store::stable_id(&f.subject.to_lowercase());
+    // Semantic belief-revision: if a fact about the SAME subject already exists (even worded
+    // differently), overwrite IT and collapse any further near-duplicates — instead of stacking a
+    // contradictory copy. Exact-string ids alone let "latest Qwen version" and "latest Qwen model
+    // 2026" coexist with conflicting values, which then get injected together and confuse the model.
+    let mut id = store::stable_id(&f.subject.to_lowercase());
+    let mut adopted = false;
+    for h in qc.search_raw(&vector, 4, FACT_DEDUP_THRESHOLD, &[], false).await {
+        let Ok(ex) = serde_json::from_value::<FactPayload>(h.payload.clone()) else {
+            continue;
+        };
+        if !same_subject(config, client, &f.subject, &ex.subject).await {
+            continue;
+        }
+        if !adopted {
+            id = h.id; // update this existing same-subject fact in place
+            adopted = true;
+        } else if h.id != id {
+            qc.delete(h.id).await; // collapse a further duplicate of the same subject
+        }
+    }
     let payload = json!({
         "subject": f.subject,
         "value": f.value,
@@ -283,6 +305,39 @@ async fn run_validity(config: &Config, client: &Client) {
         tracing::debug!(subject = %f.subject, "skills/facts: re-checking stale fact");
         maybe_learn_fact(config, client, &f.subject).await;
     }
+}
+
+const SAME_SUBJECT_SYSTEM: &str = "Two short subject descriptions for cached facts are given. Answer \
+whether they refer to the SAME underlying fact/subject (e.g. both mean 'the latest version of \
+library X', or both 'who currently holds role Y') versus genuinely different subjects. Output STRICT \
+JSON only, no prose: {\"same\": true|false}";
+
+#[derive(Deserialize)]
+struct SameVerdict {
+    #[serde(default)]
+    same: bool,
+}
+
+/// LLM check: do two fact subjects refer to the same thing? (Embeddings over-match the "latest X
+/// version" template, so a semantic-nearest hit still needs confirming before we overwrite/merge.)
+async fn same_subject(config: &Config, client: &Client, a: &str, b: &str) -> bool {
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    let user = format!("Subject A: {a}\nSubject B: {b}\n\nSame subject? Return the JSON.");
+    matches!(
+        llm::chat_json(
+            config,
+            client,
+            SAME_SUBJECT_SYSTEM,
+            &user,
+            super::background_api_key(config).as_deref(),
+            2048,
+        )
+        .await
+        .and_then(|v| serde_json::from_value::<SameVerdict>(v).ok()),
+        Some(SameVerdict { same: true })
+    )
 }
 
 fn host_of(url: &str) -> Option<String> {
