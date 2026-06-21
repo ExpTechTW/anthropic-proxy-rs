@@ -14,9 +14,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SCROLL_LIMIT: u32 = 500;
-/// bge-m3 cosine for genuine paraphrases of the same lesson sits ~0.93+, while distinct lessons
-/// stay well below; this only collapses true near-duplicates.
-const DEDUP_THRESHOLD: f32 = 0.93;
+/// Qwen3-Embedding-4B (2560-dim): genuine paraphrases of one lesson sit ~0.85-0.92 while distinct
+/// lessons stay ≤0.84, so 0.86 collapses the paraphrase floods without an LLM gate. (The old 0.93
+/// was a bge-m3 value left un-recalibrated when embeddings switched — it silently disabled dedup,
+/// letting candidates explode with 20+ copies of the same lesson.)
+const DEDUP_THRESHOLD: f32 = 0.86;
 
 pub fn spawn(config: Arc<Config>, client: Client) {
     if !config.skills.learn {

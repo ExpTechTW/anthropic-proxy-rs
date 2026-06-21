@@ -27,6 +27,9 @@ const MAX_LESSONS: usize = 3;
 const JUDGE_MAX_TOKENS: u32 = 3072;
 /// A new lesson this similar to a promoted skill is a contradiction candidate worth an LLM check.
 const CONTRA_MIN_SCORE: f32 = 0.82;
+/// Write-side near-identical dedup (Qwen3-Embedding-4B): a new lesson this similar to an existing
+/// skill reuses/skips it instead of stacking a paraphrase copy. Conservative (cosine-only, no LLM).
+const SKILL_DEDUP_THRESHOLD: f32 = 0.90;
 const CONTRA_MAX_TOKENS: u32 = 2048;
 const CONTRA_SYSTEM: &str = "You compare two engineering lessons for an AI coding assistant. Decide \
 whether lesson B CONTRADICTS lesson A — i.e. gives opposite or incompatible advice for the same \
@@ -199,8 +202,24 @@ async fn distill(config: &Config, client: &Client, transcript: &str, api_key: Op
         } else {
             l.kind.trim().to_ascii_lowercase()
         };
-        // Stable id from the title so re-distilling the same lesson updates rather than duplicates.
-        let id = store::stable_id(&l.title.to_lowercase());
+        // Semantic dedup at the source: if a near-identical skill already exists (any tier, even a
+        // differently-worded paraphrase), don't stack another copy. If it's already promoted, this
+        // candidate adds nothing — skip it (and never demote the promoted one). If it's another
+        // candidate, update it in place. Without this, re-distilling the same lesson under slightly
+        // different titles piled up dozens of duplicates (`stable_id(title)` keys on the title only).
+        let near = qc.search_raw(&vector, 1, SKILL_DEDUP_THRESHOLD, &[], false).await;
+        let id = match near.first() {
+            Some(h) => {
+                let ex_tier = serde_json::from_value::<store::SkillPayload>(h.payload.clone())
+                    .map(|p| p.tier)
+                    .unwrap_or_default();
+                if ex_tier == "verified" || ex_tier == "trusted" {
+                    continue; // already covered by a promoted skill
+                }
+                h.id // reinforce the existing candidate instead of duplicating
+            }
+            None => store::stable_id(&l.title.to_lowercase()),
+        };
         let payload = json!({
             "tier": "candidate",
             "title": l.title,
