@@ -80,7 +80,11 @@ evidence is insufficient or conflicting, return an empty subject. Output STRICT 
 
 fn half_life_secs(volatility: &str) -> u64 {
     match volatility {
-        "high" => 3 * 86_400,    // versions / prices / news
+        // Short for fast-moving facts (versions/prices/news): they decay out of injection within
+        // ~8h unless freshly re-confirmed, and the validity loop re-checks them every ~3h. So a
+        // high-volatility fact is only injected when very fresh — otherwise the model live-searches
+        // (more reliable for "latest X" than a possibly-stale/mis-extracted cached value).
+        "high" => 6 * 3_600,     // versions / prices / breaking news
         "medium" => 30 * 86_400, // leadership / rankings
         _ => 180 * 86_400,       // slow-moving
     }
