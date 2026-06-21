@@ -146,15 +146,7 @@ async fn research(config: &Config, client: &Client, question: &str) -> Option<Le
     let user = format!(
         "Question: {question}\n\nWeb evidence (untrusted):\n{evidence}\n\nReturn the JSON now."
     );
-    let value = llm::chat_json(
-        config,
-        client,
-        RESEARCH_SYSTEM,
-        &user,
-        super::background_api_key(config).as_deref(),
-        RESEARCH_MAX_TOKENS,
-    )
-    .await?;
+    let value = llm::chat_json_hard(config, client, RESEARCH_SYSTEM, &user, RESEARCH_MAX_TOKENS).await?;
     let lesson: Lesson = serde_json::from_value(value).ok()?;
     if lesson.title.trim().is_empty() || lesson.body.trim().is_empty() {
         return None;

@@ -79,6 +79,10 @@ pub struct SkillsConfig {
     /// bearer if that is set (e.g. an authed/metered upstream), else with no auth (e.g. a no-auth
     /// internal backend); unset uses the authed upstream + the client key.
     pub llm_url: Option<String>,
+    /// OpenRouter API key. When set, HARD background tasks tier up to a strong free model
+    /// (nemotron) on OpenRouter (rate-limited), failing over to a paid backup (gemini) after
+    /// repeated failures; unset keeps everything on the self-hosted `auto` backend.
+    pub openrouter_key: Option<String>,
     /// How often the verification/promotion loop runs (seconds).
     pub verify_interval_secs: u64,
     /// How long a `verified` entry must soak before it can become `trusted` (seconds).
@@ -136,6 +140,7 @@ impl Default for SkillsConfig {
             api_key: None,
             retention_days: 30,
             llm_url: None,
+            openrouter_key: None,
             verify_interval_secs: 300,
             soak_secs: 14 * 24 * 60 * 60,
             verify_backoff_secs: 6 * 60 * 60,
@@ -224,6 +229,10 @@ impl SkillsConfig {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        let openrouter_key = env::var("ANTHROPIC_PROXY_SKILLS_OPENROUTER_KEY")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         let verify_interval_secs = env::var("ANTHROPIC_PROXY_SKILLS_VERIFY_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -297,6 +306,7 @@ impl SkillsConfig {
             api_key,
             retention_days,
             llm_url,
+            openrouter_key,
             verify_interval_secs,
             soak_secs,
             verify_backoff_secs,

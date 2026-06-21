@@ -198,15 +198,7 @@ async fn merge(config: &Config, client: &Client, members: &[&store::SkillPayload
         _ => String::new(),
     };
     let user = format!("Overlapping lessons:\n{listing}{evidence}\n\nMerge them now. Return the JSON.");
-    let value = llm::chat_json(
-        config,
-        client,
-        MERGE_SYSTEM,
-        &user,
-        super::background_api_key(config).as_deref(),
-        MERGE_MAX_TOKENS,
-    )
-    .await?;
+    let value = llm::chat_json_hard(config, client, MERGE_SYSTEM, &user, MERGE_MAX_TOKENS).await?;
     serde_json::from_value(value).ok()
 }
 

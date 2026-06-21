@@ -128,7 +128,7 @@ async fn distill(config: &Config, client: &Client, transcript: &str, api_key: Op
     let user = format!("Transcript:\n{transcript}\n\nReturn the JSON now.");
     tracing::debug!(transcript_len = transcript.len(), "skills/distill: judging");
     let Some(value) =
-        llm::chat_json(config, client, JUDGE_SYSTEM, &user, api_key, JUDGE_MAX_TOKENS).await
+        llm::chat_json_hard(config, client, JUDGE_SYSTEM, &user, JUDGE_MAX_TOKENS).await
     else {
         tracing::warn!("skills/distill: judge returned no usable JSON");
         return;
