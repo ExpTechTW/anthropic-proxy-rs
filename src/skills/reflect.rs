@@ -29,6 +29,9 @@ const SCROLL_LIMIT: u32 = 500;
 /// (it returns an empty title for a non-mergeable mix).
 const CONSOLIDATE_THRESHOLD: f32 = 0.85;
 const MAX_CLUSTER: usize = 6;
+/// Cap merges per run so one pass over a large candidate pile doesn't burst the LLM (and its
+/// web-grounding searches); the loop runs every interval and converges over a few passes.
+const MAX_MERGES_PER_RUN: usize = 6;
 /// Generous: reasoning models burn ~1K tokens of reasoning_content before the JSON merge.
 const MERGE_MAX_TOKENS: u32 = 2048;
 
@@ -74,13 +77,11 @@ async fn run_once(config: &Config, client: &Client) {
         config.skills.collection.clone(),
         client.clone(),
     );
-    // Only consolidate stable (verified/trusted) knowledge; candidates aren't settled yet.
-    let all: Vec<_> = qc
-        .scroll_all_with_vectors(SCROLL_LIMIT)
-        .await
-        .into_iter()
-        .filter(|(_, p, _)| matches!(p.tier.as_str(), "verified" | "trusted"))
-        .collect();
+    // Consolidate paraphrase clusters across ALL tiers — candidates included. Repeated distillation
+    // of the same lesson floods the candidate pile with near-duplicates worded too differently for
+    // cosine-only curate to merge safely; the LLM merge gate here keeps genuinely-distinct lessons
+    // apart (returns an empty title for a non-mergeable mix).
+    let all: Vec<_> = qc.scroll_all_with_vectors(SCROLL_LIMIT).await;
 
     let mut used: HashSet<u64> = HashSet::new();
     let mut consolidated = 0usize;
@@ -116,11 +117,15 @@ async fn run_once(config: &Config, client: &Client) {
             continue; // model judged them not truly mergeable
         }
 
-        // Inherit the cluster's highest tier + earliest timestamps (preserve trust level + soak).
+        // Inherit the cluster's HIGHEST tier + earliest timestamps (preserve trust + soak). An
+        // all-candidate cluster stays a candidate (it must still earn promotion); a mixed cluster
+        // keeps its promoted status.
         let tier = if members.iter().any(|m| m.tier == "trusted") {
             "trusted"
-        } else {
+        } else if members.iter().any(|m| m.tier == "verified") {
             "verified"
+        } else {
+            "candidate"
         };
         let verified_at = members.iter().filter_map(|m| m.verified_at).min();
         let created_at = members.iter().filter_map(|m| m.created_at).min();
@@ -162,6 +167,9 @@ async fn run_once(config: &Config, client: &Client) {
             "consolidate",
             json!({"title": merged.title.clone(), "from": cluster.len(), "tier": tier}),
         );
+        if consolidated >= MAX_MERGES_PER_RUN {
+            break; // chip away; the loop runs again next interval
+        }
     }
     if consolidated > 0 {
         tracing::info!(clusters = consolidated, "skills/reflect: consolidation pass done");
