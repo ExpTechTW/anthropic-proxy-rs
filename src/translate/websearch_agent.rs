@@ -489,16 +489,20 @@ async fn run_loop(
                 Some(match p.kind {
                     WebKind::Search => {
                         let result = match searx {
-                            Some(sx) => match sx.search(&p.arg, SEARCH_LIMIT).await {
-                                Ok(r) => Ok(r),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "web agent: searxng failed ({e}); falling back to open-websearch"
-                                    );
-                                    let engines = [SEARCH_ENGINE.to_string()];
-                                    ws.search(&p.arg, SEARCH_LIMIT, &engines, SEARCH_MODE).await
+                            Some(sx) => {
+                                // Interactive search draws the User half of the shared SearXNG budget.
+                                crate::skills::search_gate(crate::skills::SearchLane::User).await;
+                                match sx.search(&p.arg, SEARCH_LIMIT).await {
+                                    Ok(r) => Ok(r),
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "web agent: searxng failed ({e}); falling back to open-websearch"
+                                        );
+                                        let engines = [SEARCH_ENGINE.to_string()];
+                                        ws.search(&p.arg, SEARCH_LIMIT, &engines, SEARCH_MODE).await
+                                    }
                                 }
-                            },
+                            }
                             None => {
                                 let engines = [SEARCH_ENGINE.to_string()];
                                 ws.search(&p.arg, SEARCH_LIMIT, &engines, SEARCH_MODE).await

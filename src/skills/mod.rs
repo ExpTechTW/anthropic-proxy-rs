@@ -56,28 +56,76 @@ use reqwest::Client;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Global minimum gap between background web searches. The LLM (vllm) is unmetered, but SearXNG is
-/// the real constraint: each search fans out to ~20 engines and the strict ones (Brave/DuckDuckGo/
-/// Startpage) CAPTCHA and get suspended under load. Serializing background searches to a sustainable
-/// rate keeps the engine pool healthy (paced 2s-apart searches return full results) while the
-/// aggressive learning loops queue here instead of hammering it.
-const SEARCH_MIN_GAP: Duration = Duration::from_millis(2000);
+// SearXNG is the one rate-limited resource (engines CAPTCHA under load), so ALL searches —
+// interactive `web_search` AND background learning — share ONE global budget, paced evenly to a
+// sustainable total rate. The budget is split fairly 50/50 between the two lanes WHEN BOTH are busy,
+// but is **work-conserving**: if one lane is idle the other uses the whole budget (capacity is never
+// wasted). Token-by-token even pacing, never a burst-then-idle.
+/// Min gap between any two searches (total rate cap across both lanes).
+const SEARCH_TOTAL_GAP: Duration = Duration::from_millis(2000);
+/// A lane held to its 50% share gets every other slot (2× the total gap).
+const SEARCH_LANE_GAP: Duration = Duration::from_millis(4000);
+/// The other lane counts as "active" (→ enforce the 50/50 split) if its last grant is this recent
+/// (or still queued ahead).
+const SEARCH_FAIR_WINDOW: Duration = Duration::from_millis(4000);
 
-/// Reserve the next search slot (≥ `SEARCH_MIN_GAP` after the previous) and return how long to wait
-/// for it. Lock is held only for the arithmetic (never across the await), so callers queue fairly.
-async fn search_gate() {
-    static LAST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+/// Which half of the SearXNG budget a search draws from.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum SearchLane {
+    /// Interactive `web_search` emulation (client-facing).
+    User,
+    /// Background learning loops (verify / proactive / facts / reflect).
+    Background,
+}
+
+struct GateState {
+    global_last: Option<Instant>,
+    user_last: Option<Instant>,
+    bg_last: Option<Instant>,
+}
+
+/// Reserve this lane's next search slot and wait for it. Enforces the global even pace; while the
+/// OTHER lane is also active, holds this lane to its 50% share — otherwise lets it use the full
+/// budget (work-conserving). Lock is held only for the arithmetic, never across the await.
+pub(crate) async fn search_gate(lane: SearchLane) {
+    static STATE: OnceLock<Mutex<GateState>> = OnceLock::new();
     let now = Instant::now();
-    let slot = {
-        let mut last = LAST.get_or_init(|| Mutex::new(None)).lock().unwrap();
-        let slot = match *last {
-            Some(prev) => (prev + SEARCH_MIN_GAP).max(now),
+    let grant = {
+        let mut s = STATE
+            .get_or_init(|| {
+                Mutex::new(GateState {
+                    global_last: None,
+                    user_last: None,
+                    bg_last: None,
+                })
+            })
+            .lock()
+            .unwrap();
+        // Global even pace (total-rate cap across both lanes).
+        let mut grant = match s.global_last {
+            Some(t) => (t + SEARCH_TOTAL_GAP).max(now),
             None => now,
         };
-        *last = Some(slot);
-        slot
+        let (my_last, other_last) = match lane {
+            SearchLane::User => (s.user_last, s.bg_last),
+            SearchLane::Background => (s.bg_last, s.user_last),
+        };
+        // Only throttle this lane to its 50% share while the other lane is active (recently granted
+        // or queued ahead); if the other lane is idle, skip it so this lane uses the whole budget.
+        let other_active = other_last.is_some_and(|t| t + SEARCH_FAIR_WINDOW >= now);
+        if other_active {
+            if let Some(t) = my_last {
+                grant = grant.max(t + SEARCH_LANE_GAP);
+            }
+        }
+        s.global_last = Some(grant);
+        match lane {
+            SearchLane::User => s.user_last = Some(grant),
+            SearchLane::Background => s.bg_last = Some(grant),
+        }
+        grant
     };
-    let delay = slot.checked_duration_since(now).unwrap_or(Duration::ZERO);
+    let delay = grant.checked_duration_since(now).unwrap_or(Duration::ZERO);
     if !delay.is_zero() {
         tokio::time::sleep(delay).await;
     }
@@ -119,7 +167,7 @@ pub(crate) async fn web_search(
     query: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<crate::websearch::SearchResult>> {
-    search_gate().await; // throttle: SearXNG is the bottleneck, not the (unmetered) LLM
+    search_gate(SearchLane::Background).await; // background half of the shared SearXNG budget
     if let Some(url) = &config.searxng_url {
         match crate::searx::SearxClient::new(url.clone(), client.clone())
             .search(query, limit)
