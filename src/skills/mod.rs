@@ -368,28 +368,31 @@ fn append_system_block(req: &mut anthropic::AnthropicRequest, text: String) {
     req.system = Some(new_system);
 }
 
-/// The text of the most recent `user` message — the retrieval query. Joins the text blocks of a
-/// structured message; returns `None` if there is no non-empty user text.
-pub fn last_user_text(req: &anthropic::AnthropicRequest) -> Option<String> {
-    for msg in req.messages.iter().rev() {
-        if msg.role != "user" {
-            continue;
-        }
-        let text = match &msg.content {
-            anthropic::MessageContent::Text(t) => t.clone(),
-            anthropic::MessageContent::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    anthropic::ContentBlock::Text { text, .. } => Some(text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        };
-        let text = text.trim().to_string();
-        if !text.is_empty() {
-            return Some(text);
-        }
+/// The injection/learning query — but ONLY when the latest turn is a fresh user message carrying
+/// real text. Returns `None` for tool-loop continuations (the last message is a `tool_result` with
+/// no text) or assistant turns, so retrieval + injection are skipped on those steps. In a multi-step
+/// tool loop the same question would otherwise be re-embedded and re-injected on every step (wasted
+/// GPU embeds + repeated injected tokens); this fires only on genuinely new user turns.
+pub fn fresh_user_query(req: &anthropic::AnthropicRequest) -> Option<String> {
+    let last = req.messages.last()?;
+    if last.role != "user" {
+        return None;
     }
-    None
+    let text = match &last.content {
+        anthropic::MessageContent::Text(t) => t.clone(),
+        anthropic::MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|b| match b {
+                anthropic::ContentBlock::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }

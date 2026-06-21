@@ -29,54 +29,59 @@ pub async fn proxy_handler(
     let api_key = resolve_api_key(&config, &headers);
     skills::remember_api_key(api_key.as_deref());
 
-    let user_text = skills::last_user_text(&req).unwrap_or_default();
-    // Stage 5: record the asked question for proactive research (no-op unless proactive enabled).
-    if config.skills.proactive {
-        skills::record_question(&user_text);
-    }
-
-    // Auto-inject relevant learned skills (Stage 1). On by default when the feature is enabled;
-    // a client can opt one request out with `x-skills-inject: off`. Best-effort: embedding/Qdrant
-    // failures return no skills and the request proceeds untouched, so it can never break a call.
-    let injected_skills = if config.skills.enabled && !skills_inject_disabled(&headers) {
-        let found = skills::retrieve(&config, &client, &user_text, api_key.as_deref()).await;
-        let ids = skills::inject(&mut req, &found);
-        if !ids.is_empty() {
-            tracing::info!(
-                count = ids.len(),
-                titles = %found.iter().map(|s| s.title.as_str()).collect::<Vec<_>>().join(" | "),
-                "skills: injected into request"
-            );
-            skills::log_event(
-                "inject",
-                serde_json::json!({
-                    "n": ids.len(),
-                    "skills": found.iter().map(|s| s.title.clone()).collect::<Vec<_>>(),
-                    "top": found.iter().map(|s| s.score).fold(0.0_f32, f32::max),
-                }),
-            );
+    // Act only on a FRESH user turn — the last message must be a user message with real text.
+    // Tool-loop continuations (last message is a tool_result) reuse the same question every step;
+    // skipping them avoids redundant query embeddings + repeated injection across the loop.
+    let inject_ok = !skills_inject_disabled(&headers);
+    let mut injected_skills: Vec<String> = Vec::new();
+    if let Some(user_text) = skills::fresh_user_query(&req) {
+        let user_text = user_text.as_str();
+        // Stage 5: record the asked question for proactive research (no-op unless enabled).
+        if config.skills.proactive {
+            skills::record_question(user_text);
         }
-        ids
-    } else {
-        Vec::new()
-    };
 
-    // Docs push-injection (streaming-preserving): fetch docs for indexed libraries mentioned in
-    // the query and inject as a system block. No-op unless ANTHROPIC_PROXY_SKILLS_DOCS_INJECT=1.
-    if config.skills.docs_inject {
-        if let Some(docs) = skills::relevant_docs(&config, &client, &user_text).await {
-            skills::inject_docs(&mut req, &docs);
-            tracing::info!("skills: injected library documentation");
+        // Auto-inject relevant learned skills (Stage 1). A client can opt one request out with
+        // `x-skills-inject: off`. Best-effort: embedding/Qdrant failures inject nothing and the
+        // request proceeds untouched, so it can never break a call.
+        if config.skills.enabled && inject_ok {
+            let found = skills::retrieve(&config, &client, user_text, api_key.as_deref()).await;
+            let ids = skills::inject(&mut req, &found);
+            if !ids.is_empty() {
+                tracing::info!(
+                    count = ids.len(),
+                    titles = %found.iter().map(|s| s.title.as_str()).collect::<Vec<_>>().join(" | "),
+                    "skills: injected into request"
+                );
+                skills::log_event(
+                    "inject",
+                    serde_json::json!({
+                        "n": ids.len(),
+                        "skills": found.iter().map(|s| s.title.clone()).collect::<Vec<_>>(),
+                        "top": found.iter().map(|s| s.score).fold(0.0_f32, f32::max),
+                    }),
+                );
+            }
+            injected_skills = ids;
         }
-    }
 
-    // Factual memory read-side: inject still-fresh, time-stamped facts relevant to the query
-    // (freshness-weighted; rendered "as of <date>"). Respects the same opt-out as skill injection.
-    if config.skills.facts && !skills_inject_disabled(&headers) {
-        if let Some(facts) = skills::relevant_facts(&config, &client, &user_text).await {
-            skills::inject_facts(&mut req, &facts);
-            tracing::info!("skills: injected current facts");
-            skills::log_event("fact_inject", serde_json::json!({"facts": facts.trim()}));
+        // Docs push-injection (streaming-preserving): fetch docs for indexed libraries mentioned in
+        // the query. No-op unless ANTHROPIC_PROXY_SKILLS_DOCS_INJECT=1; respects the same opt-out.
+        if config.skills.docs_inject && inject_ok {
+            if let Some(docs) = skills::relevant_docs(&config, &client, user_text).await {
+                skills::inject_docs(&mut req, &docs);
+                tracing::info!("skills: injected library documentation");
+            }
+        }
+
+        // Factual memory read-side: inject still-fresh, time-stamped facts relevant to the query
+        // (freshness-weighted; rendered "as of <date>"). Same opt-out as skill injection.
+        if config.skills.facts && inject_ok {
+            if let Some(facts) = skills::relevant_facts(&config, &client, user_text).await {
+                skills::inject_facts(&mut req, &facts);
+                tracing::info!("skills: injected current facts");
+                skills::log_event("fact_inject", serde_json::json!({"facts": facts.trim()}));
+            }
         }
     }
 
