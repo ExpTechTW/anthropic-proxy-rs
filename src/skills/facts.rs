@@ -188,7 +188,11 @@ pub async fn maybe_learn_fact(config: &Config, client: &Client, question: &str) 
 const FACTS_TOP: u32 = 5;
 const FACTS_MIN_SCORE: f32 = 0.5; // facts are specific — require a decent match before injecting
 const FRESH_FLOOR: f32 = 0.25; // skip facts decayed too far (likely stale)
-const FACTS_INJECT_MAX: usize = 2;
+// Inject only the SINGLE best fact for a query. Two facts retrieved for one query are usually about
+// the same subject (the store can hold divergently-worded duplicates that cosine can't merge), so
+// injecting >1 risks feeding the model contradictory values — which makes it distrust them and
+// re-search anyway. One authoritative "as of <date>" line is the safe choice.
+const FACTS_INJECT_MAX: usize = 1;
 
 /// Retrieve still-fresh facts relevant to `query`, ranked by similarity × freshness (a recency
 /// prior fused with semantic match — proven near-perfect on freshness tasks), and format them as
