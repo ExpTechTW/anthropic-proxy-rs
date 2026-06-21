@@ -23,10 +23,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use reqwest::Client;
 
 const SCROLL_LIMIT: u32 = 500;
-/// Nearest-neighbour gathering threshold. bge-m3 scores are compressed, so paraphrases of one
-/// lesson can sit ~0.72-0.85 (well below the 0.93 dedup) — kept loose to actually catch them, with
-/// the LLM merge as the real gate (it returns an empty title for a non-mergeable mix).
-const CONSOLIDATE_THRESHOLD: f32 = 0.72;
+/// Nearest-neighbour gathering threshold. With Qwen3-Embedding-4B (2560-dim) distinct-but-related
+/// skills sit ~0.72-0.84 and only true paraphrases reach ~0.85+, so gather at 0.85 to avoid
+/// presenting genuinely-different lessons as merge candidates; the LLM merge is the final gate
+/// (it returns an empty title for a non-mergeable mix).
+const CONSOLIDATE_THRESHOLD: f32 = 0.85;
 const MAX_CLUSTER: usize = 6;
 /// Generous: reasoning models burn ~1K tokens of reasoning_content before the JSON merge.
 const MERGE_MAX_TOKENS: u32 = 2048;

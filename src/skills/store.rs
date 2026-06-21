@@ -130,6 +130,26 @@ struct RawScrollPoint {
     payload: Value,
 }
 
+#[derive(Deserialize)]
+struct ScrollVecValueResponse {
+    result: ScrollVecValueResult,
+}
+
+#[derive(Deserialize)]
+struct ScrollVecValueResult {
+    #[serde(default)]
+    points: Vec<ScrollVecValuePoint>,
+}
+
+#[derive(Deserialize)]
+struct ScrollVecValuePoint {
+    id: Value,
+    #[serde(default)]
+    payload: Value,
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
+}
+
 /// One scored search hit with the raw payload (+ optionally the vector) — used by retrieval that
 /// needs the vector (MMR diversity) or a non-`SkillPayload` shape (facts).
 pub struct RawScored {
@@ -393,6 +413,39 @@ impl QdrantClient {
             .points
             .into_iter()
             .filter_map(|p| id_as_u64(&p.id).map(|id| (id, p.payload)))
+            .collect()
+    }
+
+    /// Scroll up to `limit` points returning (id, raw payload Value, vector) — for the facts
+    /// dedup sweep (different payload than SkillPayload, needs vectors). Best-effort: empty on failure.
+    pub async fn scroll_payloads_with_vectors(&self, limit: u32) -> Vec<(u64, Value, Vec<f32>)> {
+        let url = format!("{}/collections/{}/points/scroll", self.base, self.collection);
+        let body = json!({ "limit": limit, "with_payload": true, "with_vector": true });
+        let Ok(resp) = self
+            .http
+            .post(&url)
+            .timeout(QDRANT_TIMEOUT)
+            .json(&body)
+            .send()
+            .await
+        else {
+            return Vec::new();
+        };
+        if !resp.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(parsed) = resp.json::<ScrollVecValueResponse>().await else {
+            return Vec::new();
+        };
+        parsed
+            .result
+            .points
+            .into_iter()
+            .filter_map(|p| {
+                let id = id_as_u64(&p.id)?;
+                let vector = p.vector?;
+                Some((id, p.payload, vector))
+            })
             .collect()
     }
 

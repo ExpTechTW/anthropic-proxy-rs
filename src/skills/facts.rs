@@ -26,8 +26,10 @@ const FACT_MAX_TOKENS: u32 = 2048;
 const MIN_DOMAINS: usize = 2; // independent corroborating hosts before we cache a value
 const MIN_CONFIDENCE: f32 = 0.6;
 /// Gather near-subject facts above this score; the LLM then confirms whether they're truly the
-/// same subject before overwriting/collapsing (cosine alone over-merges "latest X" templates).
-const FACT_DEDUP_THRESHOLD: f32 = 0.80;
+/// same subject before overwriting/collapsing. With Qwen3-Embedding-4B a same-subject pair scores
+/// ~0.84 while different-subject "latest X version" templates still reach ~0.80, so we gather at
+/// 0.72 and let the LLM be the real gate (it rejects the template false-positives).
+const FACT_DEDUP_THRESHOLD: f32 = 0.72;
 const FACTS_SCROLL: u32 = 300;
 const DEFAULT_HALF_LIFE: u64 = 30 * 86_400;
 
@@ -190,7 +192,8 @@ pub async fn maybe_learn_fact(config: &Config, client: &Client, question: &str) 
 }
 
 const FACTS_TOP: u32 = 5;
-const FACTS_MIN_SCORE: f32 = 0.5; // facts are specific — require a decent match before injecting
+// Qwen3-Embedding-4B (2560-dim): cross-topic facts score ~0.6-0.64, on-topic ~0.76+; 0.7 separates.
+const FACTS_MIN_SCORE: f32 = 0.7; // facts are specific — require a strong match before injecting
 const FRESH_FLOOR: f32 = 0.25; // skip facts decayed too far (likely stale)
 // Inject only the SINGLE best fact for a query. Two facts retrieved for one query are usually about
 // the same subject (the store can hold divergently-worded duplicates that cosine can't merge), so
@@ -312,6 +315,72 @@ async fn run_validity(config: &Config, client: &Client) {
         }
         tracing::debug!(subject = %f.subject, "skills/facts: re-checking stale fact");
         maybe_learn_fact(config, client, &f.subject).await;
+    }
+    // Background dedup: collapse same-subject duplicates that the write-side overwrite missed
+    // (the LLM re-phrases the same fact differently across researches, scattering their vectors).
+    dedup_facts(config, client, &qc).await;
+}
+
+/// Sweep the facts store for duplicate entries about the same subject and keep only the freshest.
+/// Write-side overwrite can't always catch these: the LLM extraction phrases the same fact
+/// differently each research ("latest open-source Qwen LLM version" vs "latest Qwen model version
+/// 2026"), so their vectors land too far apart to merge on a single nearest-neighbour lookup. Here
+/// we compare all near pairs and let the LLM confirm same-subject before deleting the staler one.
+async fn dedup_facts(config: &Config, client: &Client, qc: &store::QdrantClient) {
+    let facts = qc.scroll_payloads_with_vectors(FACTS_SCROLL).await;
+    let mut removed: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for i in 0..facts.len() {
+        if removed.contains(&facts[i].0) {
+            continue;
+        }
+        let Ok(fi) = serde_json::from_value::<FactPayload>(facts[i].1.clone()) else {
+            continue;
+        };
+        for j in (i + 1)..facts.len() {
+            if removed.contains(&facts[j].0) {
+                continue;
+            }
+            if cosine(&facts[i].2, &facts[j].2) < FACT_DEDUP_THRESHOLD {
+                continue;
+            }
+            let Ok(fj) = serde_json::from_value::<FactPayload>(facts[j].1.clone()) else {
+                continue;
+            };
+            if !same_subject(config, client, &fi.subject, &fj.subject).await {
+                continue;
+            }
+            // Keep the fresher observation; delete the staler duplicate.
+            let i_fresher = fi.observed_at.unwrap_or(0) >= fj.observed_at.unwrap_or(0);
+            let (drop_id, dropped, kept) = if i_fresher {
+                (facts[j].0, fj.subject.clone(), fi.subject.clone())
+            } else {
+                (facts[i].0, fi.subject.clone(), fj.subject.clone())
+            };
+            if qc.delete(drop_id).await {
+                removed.insert(drop_id);
+                tracing::info!(%dropped, %kept, "skills/facts: deduped duplicate fact");
+                super::eventlog::record("fact_dedup", json!({ "dropped": dropped, "kept": kept }));
+            }
+            if !i_fresher {
+                break; // fact i was deleted; move the outer cursor on
+            }
+        }
+    }
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na.sqrt() * nb.sqrt())
     }
 }
 
