@@ -41,6 +41,17 @@ pub async fn proxy_handler(
             skills::record_question(user_text);
         }
 
+        // Factual memory FIRST, so the authoritative current value is the most prominent injected
+        // block. It must precede docs — the framing tells the model facts override the docs "below"
+        // (otherwise verbose, version-less docs drown out the one-line fact). Same opt-out.
+        if config.skills.facts && inject_ok {
+            if let Some(facts) = skills::relevant_facts(&config, &client, user_text).await {
+                skills::inject_facts(&mut req, &facts);
+                tracing::info!("skills: injected current facts");
+                skills::log_event("fact_inject", serde_json::json!({"facts": facts.trim()}));
+            }
+        }
+
         // Auto-inject relevant learned skills (Stage 1). A client can opt one request out with
         // `x-skills-inject: off`. Best-effort: embedding/Qdrant failures inject nothing and the
         // request proceeds untouched, so it can never break a call.
@@ -65,22 +76,12 @@ pub async fn proxy_handler(
             injected_skills = ids;
         }
 
-        // Docs push-injection (streaming-preserving): fetch docs for indexed libraries mentioned in
-        // the query. No-op unless ANTHROPIC_PROXY_SKILLS_DOCS_INJECT=1; respects the same opt-out.
+        // Docs push-injection LAST — background API/usage reference; its framing defers to the facts
+        // block above for version/current-value questions. No-op unless DOCS_INJECT=1; same opt-out.
         if config.skills.docs_inject && inject_ok {
             if let Some(docs) = skills::relevant_docs(&config, &client, user_text).await {
                 skills::inject_docs(&mut req, &docs);
                 tracing::info!("skills: injected library documentation");
-            }
-        }
-
-        // Factual memory read-side: inject still-fresh, time-stamped facts relevant to the query
-        // (freshness-weighted; rendered "as of <date>"). Same opt-out as skill injection.
-        if config.skills.facts && inject_ok {
-            if let Some(facts) = skills::relevant_facts(&config, &client, user_text).await {
-                skills::inject_facts(&mut req, &facts);
-                tracing::info!("skills: injected current facts");
-                skills::log_event("fact_inject", serde_json::json!({"facts": facts.trim()}));
             }
         }
     }

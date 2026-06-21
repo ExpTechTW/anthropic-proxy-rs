@@ -321,9 +321,10 @@ pub fn inject_docs(req: &mut anthropic::AnthropicRequest, docs: &str) {
         return;
     }
     let text = format!(
-        "# Up-to-date library documentation (retrieved)\n\
-         The following are current docs for libraries mentioned in the task — prefer them over \
-         prior knowledge.\n\n{docs}"
+        "# Library documentation (retrieved, for API/usage reference)\n\
+         Current docs for libraries mentioned in the task — prefer them over prior knowledge for \
+         API and usage details. For latest-version or other current-value questions, use the \
+         'Current facts' block above instead (these docs may omit the version).\n\n{docs}"
     );
     append_system_block(req, text);
 }
@@ -335,9 +336,11 @@ pub fn inject_facts(req: &mut anthropic::AnthropicRequest, facts: &str) {
         return;
     }
     let text = format!(
-        "# Current facts (time-sensitive, retrieved)\n\
-         Verified, time-stamped facts relevant to the task. Each notes when it was last confirmed — \
-         treat it as current only as of that date, and re-check if precision matters.\n\n{facts}"
+        "# Current facts (authoritative, time-stamped)\n\
+         Verified current values for time-sensitive questions (latest versions, current state). \
+         Use these directly as the answer — they OVERRIDE both your prior knowledge and the general \
+         library documentation below. Each is stamped with when it was last confirmed; cite that \
+         date, and suggest re-checking only if exact precision is critical.\n\n{facts}"
     );
     append_system_block(req, text);
 }
