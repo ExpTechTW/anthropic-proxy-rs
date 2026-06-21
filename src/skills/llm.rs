@@ -20,6 +20,10 @@ const LLM_TIMEOUT: Duration = Duration::from_secs(120);
 // resetting back to nemotron. Anything rate-limited/failed still completes on `auto`, so a hard
 // task never goes unlearned.
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+/// Shorter than `LLM_TIMEOUT`: a saturated free model (nemotron's free tier 504s after ~300s on
+/// OpenRouter's side) must fail FAST so the background task falls back to `auto` instead of stalling.
+/// A healthy 550B still answers well within this.
+const OPENROUTER_TIMEOUT: Duration = Duration::from_secs(60);
 const HARD_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b:free";
 const BACKUP_MODEL: &str = "google/gemini-3.1-flash-lite";
 const NEM_GAP: Duration = Duration::from_secs(120); // nemotron: at most one call per 2 min
@@ -161,7 +165,7 @@ async fn openrouter_chat(
     }
     let resp = client
         .post(OPENROUTER_URL)
-        .timeout(LLM_TIMEOUT)
+        .timeout(OPENROUTER_TIMEOUT)
         .header("Authorization", format!("Bearer {key}"))
         .header("X-Title", "anthropic-proxy-skills")
         .json(&body)
