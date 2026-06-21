@@ -132,7 +132,9 @@ pub async fn chat_json(
 }
 
 /// One OpenRouter chat turn → assistant text. Uses the configured OpenRouter key. `web_search`
-/// appends the `:online` suffix (OpenRouter web search) for the gemini backup. `None` on failure.
+/// turns on the web plugin with `engine: "native"` → the model provider's OWN search (for the
+/// gemini backup that means Gemini's native Google Search grounding, not OpenRouter's Exa plugin).
+/// `None` on failure.
 async fn openrouter_chat(
     config: &Config,
     client: &Client,
@@ -143,13 +145,8 @@ async fn openrouter_chat(
     web_search: bool,
 ) -> Option<String> {
     let key = config.skills.openrouter_key.as_deref()?;
-    let model_slug = if web_search {
-        format!("{model}:online")
-    } else {
-        model.to_string()
-    };
-    let body = json!({
-        "model": model_slug,
+    let mut body = json!({
+        "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -158,6 +155,10 @@ async fn openrouter_chat(
         "temperature": 0,
         "stream": false,
     });
+    if web_search {
+        // engine:"native" → the provider's built-in search (Gemini → Google Search grounding).
+        body["plugins"] = json!([{"id": "web", "engine": "native"}]);
+    }
     let resp = client
         .post(OPENROUTER_URL)
         .timeout(LLM_TIMEOUT)
@@ -168,7 +169,7 @@ async fn openrouter_chat(
         .await
         .ok()?;
     if !resp.status().is_success() {
-        tracing::warn!(model = %model_slug, "skills/llm: openrouter returned {}", resp.status());
+        tracing::warn!(model = %model, "skills/llm: openrouter returned {}", resp.status());
         return None;
     }
     let parsed: openai::OpenAIResponse = resp.json().await.ok()?;
