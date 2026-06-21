@@ -68,6 +68,10 @@ const SEARCH_LANE_GAP: Duration = Duration::from_millis(4000);
 /// The other lane counts as "active" (→ enforce the 50/50 split) if its last grant is this recent
 /// (or still queued ahead).
 const SEARCH_FAIR_WINDOW: Duration = Duration::from_millis(4000);
+/// Idle guard: background search won't run until this long after the most recent USER search, so
+/// the (now reliable but still IP-limited) search budget goes to real queries first and learning
+/// fills the idle gaps. Lets the learning loops be aggressive without ever delaying a user query.
+const SEARCH_BG_YIELD: Duration = Duration::from_secs(12);
 
 /// Which half of the SearXNG budget a search draws from.
 #[derive(Clone, Copy, PartialEq)]
@@ -116,6 +120,13 @@ pub(crate) async fn search_gate(lane: SearchLane) {
         if other_active {
             if let Some(t) = my_last {
                 grant = grant.max(t + SEARCH_LANE_GAP);
+            }
+        }
+        // Background yields hard to users: hold off until SEARCH_BG_YIELD past the last USER search,
+        // so learning runs in the idle gaps and never competes with a real query for the egress IPs.
+        if matches!(lane, SearchLane::Background) {
+            if let Some(t) = s.user_last {
+                grant = grant.max(t + SEARCH_BG_YIELD);
             }
         }
         s.global_last = Some(grant);
