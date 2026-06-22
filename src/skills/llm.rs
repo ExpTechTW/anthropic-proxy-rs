@@ -16,16 +16,17 @@ const LLM_TIMEOUT: Duration = Duration::from_secs(120);
 // ── Tiered routing for HARD background tasks (difficulty grading) ──────────────────────────────
 // Easy tasks (yes/no checks) stay on the self-hosted `auto` backend. Hard synthesis tasks tier up
 // to a strong FREE model on OpenRouter (nemotron), rate-limited to spread the daily free quota;
-// after repeated failures they fail over ONCE to a PAID backup (gemini, with web search) before
-// resetting back to nemotron. Anything rate-limited/failed still completes on `auto`, so a hard
-// task never goes unlearned.
+// after repeated failures they fail over ONCE to a cheap paid backup (gemini-2.5-flash-lite) before
+// resetting back to nemotron. The backup does NOT use paid native grounding — it judges the free
+// SearXNG evidence the proxy already put in the prompt. Anything rate-limited/failed still completes
+// on `auto`, so a hard task never goes unlearned.
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 /// Shorter than `LLM_TIMEOUT`: a saturated free model (nemotron's free tier 504s after ~300s on
 /// OpenRouter's side) must fail FAST so the background task falls back to `auto` instead of stalling.
 /// A healthy 550B still answers well within this.
 const OPENROUTER_TIMEOUT: Duration = Duration::from_secs(60);
 const HARD_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b:free";
-const BACKUP_MODEL: &str = "google/gemini-3.1-flash-lite";
+const BACKUP_MODEL: &str = "google/gemini-2.5-flash-lite";
 const NEM_GAP: Duration = Duration::from_secs(120); // nemotron: at most one call per 2 min
 const GEM_GAP: Duration = Duration::from_secs(600); // gemini (paid backup): at most one per 10 min
 const FAIL_THRESHOLD: u32 = 5; // nemotron failures before switching to the backup once
@@ -205,7 +206,9 @@ async fn chat_hard(
             }
         }
         Route::Gemini => {
-            match openrouter_chat(config, client, BACKUP_MODEL, system, user, max_tokens, true).await
+            // web_search=false: no paid native grounding — the prompt already carries the proxy's
+            // free SearXNG evidence, so gemini-2.5-flash-lite just judges it (≈token-cost only).
+            match openrouter_chat(config, client, BACKUP_MODEL, system, user, max_tokens, false).await
             {
                 Some(t) => Some(t),
                 None => chat(config, client, system, user, auto_key, max_tokens).await,
