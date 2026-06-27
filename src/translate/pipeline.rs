@@ -852,12 +852,21 @@ mod tests {
 
         let openai = translate_request(req, &default_policy()).unwrap();
 
+        // Multi-block system prompts are merged into ONE leading system message (strict chat
+        // templates reject a system message after index 0); both blocks' text is preserved.
         let system_msgs: Vec<_> = openai
             .messages
             .iter()
             .filter(|m| m.role == "system")
             .collect();
-        assert_eq!(system_msgs.len(), 2);
+        assert_eq!(system_msgs.len(), 1);
+        match &system_msgs[0].content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert!(text.contains("You are helpful."));
+                assert!(text.contains("Be concise."));
+            }
+            _ => panic!("expected a single text system message"),
+        }
     }
 
     #[test]
