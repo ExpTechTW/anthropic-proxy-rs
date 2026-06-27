@@ -527,6 +527,49 @@ enum SendOutcome {
     Fatal(ProxyError),
 }
 
+/// Collapse all system messages into a single LEADING system message. Strict fine-tuned chat
+/// templates (e.g. ornith/qwen) raise "System message must be at the beginning" for any system
+/// message after index 0 — which a multi-block Anthropic system prompt, structured-output, or the
+/// web agent's `/no_think` insertion can produce. No-op when there's already ≤1 system at index 0.
+pub(crate) fn normalize_system_first(messages: &mut Vec<openai::Message>) {
+    let mut count = 0usize;
+    let mut first_is_system = false;
+    for (i, m) in messages.iter().enumerate() {
+        if m.role == "system" {
+            count += 1;
+            if i == 0 {
+                first_is_system = true;
+            }
+        }
+    }
+    if count == 0 || (count == 1 && first_is_system) {
+        return;
+    }
+    let mut sys_parts: Vec<String> = Vec::new();
+    let mut rest: Vec<openai::Message> = Vec::with_capacity(messages.len());
+    for m in messages.drain(..) {
+        if m.role == "system" {
+            if let Some(openai::MessageContent::Text(t)) = &m.content {
+                if !t.trim().is_empty() {
+                    sys_parts.push(t.clone());
+                }
+            }
+            continue;
+        }
+        rest.push(m);
+    }
+    let mut out = Vec::with_capacity(rest.len() + 1);
+    if !sys_parts.is_empty() {
+        out.push(openai::Message {
+            role: "system".to_string(),
+            content: Some(openai::MessageContent::Text(sys_parts.join("\n\n"))),
+            ..Default::default()
+        });
+    }
+    out.extend(rest);
+    *messages = out;
+}
+
 /// Issue one POST to `url` and classify the result. On a 2xx the response body is
 /// left unread so streaming and non-streaming callers can consume it differently.
 async fn send_request(
@@ -535,9 +578,11 @@ async fn send_request(
     openai_req: &openai::OpenAIRequest,
     api_key: Option<&str>,
 ) -> SendOutcome {
+    let mut owned = openai_req.clone();
+    normalize_system_first(&mut owned.messages);
     let mut req_builder = client
         .post(url)
-        .json(openai_req)
+        .json(&owned)
         .timeout(Duration::from_secs(600));
 
     if let Some(key) = api_key {

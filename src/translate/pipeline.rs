@@ -29,13 +29,20 @@ pub fn translate_request(
                 messages.into_iter().map(|m| m.text).collect()
             }
         };
-        for text in texts {
+        // Concatenate into ONE leading system message. A multi-block Anthropic system prompt
+        // (Claude Code sends several) must not become several OpenAI system messages: strict chat
+        // templates (e.g. fine-tuned ornith/qwen) raise "System message must be at the beginning"
+        // for any system message after index 0.
+        let joined = texts
+            .into_iter()
+            .map(|text| sanitize_prompt(text, &policy.ignore_terms))
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if !joined.is_empty() {
             openai_messages.push(openai::Message {
                 role: "system".to_string(),
-                content: Some(openai::MessageContent::Text(sanitize_prompt(
-                    text,
-                    &policy.ignore_terms,
-                ))),
+                content: Some(openai::MessageContent::Text(joined)),
                 ..Default::default()
             });
         }
