@@ -730,7 +730,10 @@ async fn backend_call(
     let mut last_err = None;
     for url in &urls {
         for attempt in 1..=BACKEND_MAX_ATTEMPTS {
-            let mut rb = client.post(url).json(&owned).timeout(Duration::from_secs(600));
+            let mut rb = client
+                .post(url)
+                .json(&owned)
+                .timeout(Duration::from_secs(600));
             if let Some(key) = api_key {
                 rb = rb.header("Authorization", format!("Bearer {key}"));
             }
